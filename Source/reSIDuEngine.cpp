@@ -977,25 +977,31 @@ float SID::processSID()
         // Two-integrator-loop filter implementation
         // This creates a state-variable filter with simultaneous LP/BP/HP outputs
 
+        // Resonance gain compensation: High Q (low resonance coefficient) causes
+        // gain boost at the cutoff frequency. Compensate by scaling outputs by
+        // the resonance coefficient (which is essentially 1/Q).
+        // Clamp to prevent complete muting at very high resonance settings.
+        double resonanceCompensation = std::max(0.5, resonance);
+
         // Highpass output: input - (resonance * BP + LP)
         // This is the input signal with low and mid frequencies removed
         double tmp = filterInput + previousBandpass * resonance + previousLowpass;
         if (SIDRegister[0x18] & HIGHPASS_BITMASK)
-            output -= tmp;  // Mix highpass into output if enabled
+            output -= tmp * resonanceCompensation;  // Mix highpass into output if enabled
 
         // Update bandpass integrator: BP = BP - (HP * cutoff)
         // Bandpass removes highs and lows, leaving only mid frequencies
         tmp = previousBandpass - tmp * cutoff;
         previousBandpass = tmp;
         if (SIDRegister[0x18] & BANDPASS_BITMASK)
-            output -= tmp;  // Mix bandpass into output if enabled
+            output -= tmp * resonanceCompensation;  // Mix bandpass into output if enabled
 
         // Update lowpass integrator: LP = LP + (BP * cutoff)
         // Lowpass removes high frequencies, leaving only lows
         tmp = previousLowpass + tmp * cutoff;
         previousLowpass = tmp;
         if (SIDRegister[0x18] & LOWPASS_BITMASK)
-            output += tmp;  // Mix lowpass into output if enabled
+            output += tmp * resonanceCompensation;  // Mix lowpass into output if enabled
     }
     else
     {
