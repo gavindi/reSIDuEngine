@@ -777,7 +777,7 @@ float SID::processSID()
                     if (waveformCTRL & SAW_BITMASK)
                     {
                         // Pulse + Triangle + Sawtooth: all three waveforms
-                        waveformOutput = waveformOutput ? combinedWF(voiceIndex, pulseTriSaw8580, tmp >> 4, true) : 0;
+                        waveformOutput = waveformOutput ? reSIDuEngine::SID::combinedWF(voiceIndex, pulseTriSaw8580, tmp >> 4, true) : 0;
                     }
                     else
                     {
@@ -797,7 +797,8 @@ float SID::processSID()
                 else if (waveformCTRL & SAW_BITMASK)
                 {
                     // Pulse + Sawtooth
-                    waveformOutput = waveformOutput ? combinedWF(voiceIndex, pulseSaw8580, tmp >> 4, true) : 0;
+waveformOutput = waveformOutput ? reSIDuEngine::SID::combinedWF(voiceIndex, pulseSaw8580,
+                            tmp >> 4, true) : 0;
                 }
             }
         }

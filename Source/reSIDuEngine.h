@@ -562,8 +562,21 @@ private:
      * @param differ6581 If true, applies 6581-specific behavior (halving certain waveforms).
      * @return The combined waveform output value as a 16-bit unsigned integer.
      */
-    uint16_t combinedWF(int voiceIndex, const std::array<uint16_t, 4096>& waveformArray,
-                       int index, bool differ6581);
+uint16_t combinedWF(int voiceIndex, const std::array<uint16_t, 4096>& waveformArray,
+                        int index, bool differ6581);
+
+    /**
+     * Get measured combined waveform value without artificial interpolation.
+     * Direct lookup from tables based on real SID chip measurements.
+     * Follows libsidplayfp approach for accurate analog behavior.
+     */
+    uint16_t getMeasuredCombinedWF(int voiceIndex, int index, uint8_t waveformCtrl);
+
+    /**
+     * Get measured combined waveform value without artificial interpolation.
+     * Direct lookup from tables based on real SID chip measurements.
+     * Follows libsidplayfp approach for accurate analog behavior.
+     */
 
     // ========================================================================
     // Member Variables - Clock and Sample Rate
