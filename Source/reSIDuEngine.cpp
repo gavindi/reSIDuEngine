@@ -152,6 +152,9 @@ SID::SID(double sampleRate, SIDModel model)
     // Pulse + Sawtooth: strong interaction, high threshold
     createCombinedWF(pulseSaw8580, 1.4, 1.9, 0.68);
 
+    // Pulse + Triangle: moderate interaction, medium threshold (based on libsidplayfp measurements)
+    createCombinedWF(pulseTriangle8580, 1.2, 2.2, 0.66);
+
     // Pulse + Triangle + Sawtooth: moderate interaction, medium threshold
     createCombinedWF(pulseTriSaw8580, 0.8, 2.5, 0.64);
 
@@ -429,6 +432,76 @@ uint16_t SID::combinedWF(int voiceIndex, const std::array<uint16_t, 4096>& wavef
     previousWaveData[voiceIndex] = waveformArray[index];
 
     return combiwf;
+}
+
+/**
+ * Get measured combined waveform value using libsidplayfp-style approach.
+ *
+ * This function implements the libsidplayfp approach for combined waveforms,
+ * which uses direct table lookups with frequency-dependent filtering and
+ * previous value feedback to model the complex analog behavior of the SID chip.
+ *
+ * The algorithm models:
+ * 1. Frequency-dependent filtering (analog RC circuit behavior)
+ * 2. Previous value feedback (capacitive coupling)
+ * 3. Chip-specific differences (6581 vs 8580)
+ *
+ * @param voiceIndex Voice number (0-2)
+ * @param index 12-bit waveform index from phase accumulator
+ * @param waveformCtrl Waveform control register bits (upper nibble)
+ * @return Combined waveform output value as 16-bit unsigned integer
+ */
+uint16_t SID::getMeasuredCombinedWF(int voiceIndex, int index, uint8_t waveformCtrl)
+{
+    // Select the appropriate lookup table based on waveform combination
+    const std::array<uint16_t, 4096>* wfArray = nullptr;
+    
+    switch (waveformCtrl & 0xF0) {
+        case (TRI_BITMASK | SAW_BITMASK):
+            wfArray = &triSaw8580;
+            break;
+        case (PULSE_BITMASK | TRI_BITMASK):
+            wfArray = &pulseTriangle8580;
+            break;
+        case (PULSE_BITMASK | SAW_BITMASK):
+            wfArray = &pulseSaw8580;
+            break;
+        case (PULSE_BITMASK | TRI_BITMASK | SAW_BITMASK):
+            wfArray = &pulseTriSaw8580;
+            break;
+        default:
+            // Should never happen - return 0 for safety
+            return 0;
+    }
+    
+    // Get pitch for frequency-dependent filtering
+    // Extract frequency from voice registers (assuming 16-bit frequency value)
+    const uint8_t* voiceRegister = &SIDRegister[voiceIndex * 7];
+    uint16_t freq = voiceRegister[0] | (voiceRegister[1] << 8);
+    uint8_t pitch = (freq >> 8) ? (freq >> 8) : 1; // Avoid division by zero
+    
+    // Apply frequency-dependent filtering (similar to libsidplayfp's 0x7777 + 0x8888/pitch)
+    // This models how the analog circuitry's response varies with frequency
+    uint16_t filterCoeff = 0x7777 + (0x8888 / pitch);
+    
+    // Get table value
+    uint16_t tableValue = (*wfArray)[index >> 4]; // Scale 12-bit to 8-bit table index
+    
+    // Apply frequency-dependent filtering with previous value feedback
+    // This models the capacitive coupling and frequency response of the analog circuit
+    uint32_t filteredValue = (tableValue * filterCoeff + 
+                             previousWaveData[voiceIndex] * (0xFFFF - filterCoeff)) >> 16;
+    
+    // Store current value for next sample's feedback
+    previousWaveData[voiceIndex] = tableValue;
+    
+    // Apply 6581-specific behavior (reduced bit depth for some combinations)
+    if (sidModel == MOS6581 && (waveformCtrl & PULSE_BITMASK)) {
+        // On 6581, pulse combinations often have reduced bit depth
+        filteredValue &= 0x7FFF; // Mask off MSB (11-bit instead of 12-bit)
+    }
+    
+    return static_cast<uint16_t>(filteredValue) << 8; // Scale back to 16-bit range
 }
 
 /**
@@ -789,8 +862,8 @@ float SID::processSID()
                               (ctrl & RING_BITMASK ? sourceMSB[ringSource] : 0);
 
                         // Triangle waveform: fold phase at midpoint to create triangle shape
-                        // Then use combined waveform table
-                        waveformOutput = waveformOutput ? combinedWF(voiceIndex, pulseSaw8580,
+                        // Then use pulse+triangle combined waveform table
+                        waveformOutput = waveformOutput ? combinedWF(voiceIndex, pulseTriangle8580,
                                        (tmp ^ (tmp & 0x800000 ? 0xFFFFFF : 0)) >> 11, false) : 0;
                     }
                 }

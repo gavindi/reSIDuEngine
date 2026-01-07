@@ -569,14 +569,13 @@ uint16_t combinedWF(int voiceIndex, const std::array<uint16_t, 4096>& waveformAr
      * Get measured combined waveform value without artificial interpolation.
      * Direct lookup from tables based on real SID chip measurements.
      * Follows libsidplayfp approach for accurate analog behavior.
+     * 
+     * @param voiceIndex Voice number (0-2)
+     * @param index 12-bit waveform index from phase accumulator
+     * @param waveformCtrl Waveform control register bits (upper nibble)
+     * @return Combined waveform output value as 16-bit unsigned integer
      */
     uint16_t getMeasuredCombinedWF(int voiceIndex, int index, uint8_t waveformCtrl);
-
-    /**
-     * Get measured combined waveform value without artificial interpolation.
-     * Direct lookup from tables based on real SID chip measurements.
-     * Follows libsidplayfp approach for accurate analog behavior.
-     */
 
     // ========================================================================
     // Member Variables - Clock and Sample Rate
@@ -666,6 +665,7 @@ uint16_t combinedWF(int voiceIndex, const std::array<uint16_t, 4096>& waveformAr
     std::array<uint16_t, 4096> triSaw8580;      ///< Triangle + Sawtooth combined waveform (8580-style)
     std::array<uint16_t, 4096> pulseSaw8580;    ///< Pulse + Sawtooth combined waveform (8580-style)
     std::array<uint16_t, 4096> pulseTriSaw8580; ///< Pulse + Triangle + Sawtooth combined waveform (8580-style)
+    std::array<uint16_t, 4096> pulseTriangle8580; ///< Pulse + Triangle combined waveform (8580-style)
 
     // ========================================================================
     // Member Variables - ADSR Timing Lookup Tables
