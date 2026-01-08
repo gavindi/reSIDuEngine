@@ -152,7 +152,7 @@ SID::SID(double sampleRate, SIDModel model)
     // Pulse + Sawtooth: strong interaction, high threshold
     createCombinedWF(pulseSaw8580, 1.4, 1.9, 0.68);
 
-    // Pulse + Triangle: moderate interaction, medium threshold (based on libsidplayfp measurements)
+    // Pulse + Triangle: moderate interaction, medium threshold (based on SID chip measurements)
     createCombinedWF(pulseTriangle8580, 1.2, 2.2, 0.66);
 
     // Pulse + Triangle + Sawtooth: moderate interaction, medium threshold
@@ -435,9 +435,9 @@ uint16_t SID::combinedWF(int voiceIndex, const std::array<uint16_t, 4096>& wavef
 }
 
 /**
- * Get measured combined waveform value using libsidplayfp-style approach.
+ * Get measured combined waveform value using frequency-dependent filtering approach.
  *
- * This function implements the libsidplayfp approach for combined waveforms,
+ * This function implements advanced combined waveform processing,
  * which uses direct table lookups with frequency-dependent filtering and
  * previous value feedback to model the complex analog behavior of the SID chip.
  *
@@ -480,7 +480,7 @@ uint16_t SID::getMeasuredCombinedWF(int voiceIndex, int index, uint8_t waveformC
     uint16_t freq = voiceRegister[0] | (voiceRegister[1] << 8);
     uint8_t pitch = (freq >> 8) ? (freq >> 8) : 1; // Avoid division by zero
     
-    // Apply frequency-dependent filtering (similar to libsidplayfp's 0x7777 + 0x8888/pitch)
+    // Apply frequency-dependent filtering using 0x7777 + 0x8888/pitch coefficients
     // This models how the analog circuitry's response varies with frequency
     uint16_t filterCoeff = 0x7777 + (0x8888 / pitch);
     

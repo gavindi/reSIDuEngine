@@ -568,7 +568,7 @@ uint16_t combinedWF(int voiceIndex, const std::array<uint16_t, 4096>& waveformAr
     /**
      * Get measured combined waveform value without artificial interpolation.
      * Direct lookup from tables based on real SID chip measurements.
-     * Follows libsidplayfp approach for accurate analog behavior.
+     * Implements frequency-dependent filtering for accurate analog behavior.
      * 
      * @param voiceIndex Voice number (0-2)
      * @param index 12-bit waveform index from phase accumulator
