@@ -14,6 +14,11 @@
 #include <array>
 #include <cmath>
 
+// M_PI is not part of the C++ standard and may not be defined on Windows
+#ifndef M_PI
+#define M_PI 3.14159265358979323846
+#endif
+
 namespace reSIDuEngine
 {
 
