@@ -1,5 +1,7 @@
 # reSIDuEngine
 
+![reSIDuEngine](assets/logo/reSIDuEngine1.png)
+
 A C++ implementation of the SID 6581/8580
 
 ## Overview
