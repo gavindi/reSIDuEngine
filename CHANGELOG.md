@@ -2,6 +2,13 @@
 
 All notable changes to reSIDuEngine will be documented in this file.
 
+## [1.3.0] - 2026-02-12
+
+### Fixed
+- SID player: Read-modify-write CPU instructions (INC, DEC, ASL, LSR, ROL, ROR) on SID registers now correctly forwarded to the engine, fixing silent playback of tunes that use RMW instructions for register updates (e.g., Fred Gray tunes)
+- SID player: Writes to SID mirror addresses ($D420-$D7FF) now forwarded to the engine, not just mirrored in memory
+- SID player: Zero-page indexed addressing modes now correctly wrap within the zero page, matching real 6502 behavior
+
 ## [1.2.0] - 2026-02-11
 
 ### Fixed

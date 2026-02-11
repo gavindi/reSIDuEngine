@@ -174,12 +174,12 @@ byte CPU() {
         switch (IR & 0x1F) {
             case 1: case 3:
                 ++PC;
-                addr = memory[memory[PC] + X] + memory[memory[PC] + X + 1] * 256;
+                addr = memory[(memory[PC] + X) & 0xFF] + memory[(memory[PC] + X + 1) & 0xFF] * 256;
                 cycles = 6;
                 break; // (zp,x)
             case 0x11: case 0x13:
                 ++PC;
-                addr = memory[memory[PC]] + memory[memory[PC] + 1] * 256 + Y;
+                addr = memory[memory[PC]] + memory[(memory[PC] + 1) & 0xFF] * 256 + Y;
                 cycles = 6;
                 break; // (zp),y
             case 0x19: case 0x1F:
@@ -201,7 +201,7 @@ byte CPU() {
                 cycles = 4;
                 break; // abs
             case 0x15:
-                addr = memory[++PC] + X;
+                addr = (memory[++PC] + X) & 0xFF;
                 cycles = 4;
                 break; // zp,x
             case 5: case 7:
@@ -209,7 +209,7 @@ byte CPU() {
                 cycles = 3;
                 break; // zp
             case 0x17:
-                addr = memory[++PC] + Y;
+                addr = (memory[++PC] + Y) & 0xFF;
                 cycles = 4;
                 break; // zp,y for LAX/SAX illegal opcodes
             case 9: case 0xB:
@@ -285,7 +285,7 @@ byte CPU() {
                 cycles = 4;
                 break; // abs
             case 0x16:
-                addr = memory[++PC] + (((IR & 0xC0) != 0x80) ? X : Y);
+                addr = (memory[++PC] + (((IR & 0xC0) != 0x80) ? X : Y)) & 0xFF;
                 cycles = 4;
                 break; // zp,x / zp,y
             case 6:
@@ -315,6 +315,7 @@ byte CPU() {
                     T &= 0xFF;
                     ST |= (!T) << 1;
                     memory[addr] = T;
+                    storadd = addr;
                     cycles += 2;
                 }
                 break;
@@ -335,6 +336,7 @@ byte CPU() {
                     T &= 0xFF;
                     ST |= (!T) << 1;
                     memory[addr] = T;
+                    storadd = addr;
                     cycles += 2;
                 }
                 break;
@@ -344,6 +346,7 @@ byte CPU() {
                     memory[addr] &= 0xFF;
                     ST &= 125;
                     ST |= (!memory[addr]) << 1 | (memory[addr] & 128);
+                    storadd = addr;
                     cycles += 2;
                 } else {
                     X--;
@@ -381,6 +384,7 @@ byte CPU() {
                     memory[addr] &= 0xFF;
                     ST &= 125;
                     ST |= (!memory[addr]) << 1 | (memory[addr] & 128);
+                    storadd = addr;
                     cycles += 2;
                 }
         }
@@ -487,7 +491,7 @@ byte CPU() {
                     cycles = 4;
                     break; // abs
                 case 0x14:
-                    addr = memory[++PC] + X;
+                    addr = (memory[++PC] + X) & 0xFF;
                     cycles = 4;
                     break; // zp,x
                 case 4:
@@ -717,7 +721,10 @@ void audio_callback(ma_device* pDevice, void* pOutput, const void* pInput, ma_ui
 
                 // Handle writes above $D420 (CJ in the USA workaround)
                 if (storadd >= 0xD420 && storadd < 0xD800 && (memory[1] & 3)) {
-                    memory[storadd & 0xD41F] = memory[storadd];
+                    unsigned int mirrorAddr = storadd & 0xD41F;
+                    memory[mirrorAddr] = memory[storadd];
+                    if (sidInstance)
+                        sidInstance->write(mirrorAddr, memory[mirrorAddr]);
                 }
 
                 // Forward SID register writes to reSIDuEngine
