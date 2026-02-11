@@ -2,6 +2,11 @@
 
 All notable changes to reSIDuEngine will be documented in this file.
 
+## [1.2.0] - 2026-02-11
+
+### Fixed
+- Gate-off/gate-on transitions within the same sample period are no longer lost, fixing missed notes in SID tunes that retrigger voices rapidly
+
 ## [1.1.0] - 2026-01-08
 
 ### Added

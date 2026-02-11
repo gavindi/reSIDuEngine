@@ -317,7 +317,34 @@ void SID::write(int addr, unsigned char value)
     // Accept addresses in multiple forms for compatibility:
     // - Full address (0xD400-0xD41F) - legacy reSIDuEngine
     // - Register offset (0-31) - reSIDfp API
-    SIDRegister[addr & 0x1F] = value;
+    int reg = addr & 0x1F;
+
+    // Detect gate transitions immediately on control register writes.
+    // Control registers: offset 4 (voice 0), 11 (voice 1), 18 (voice 2).
+    // This ensures gate-off/gate-on sequences within a single sample
+    // period are not lost (the ADSR state machine sees both transitions).
+    if (reg == 4 || reg == 11 || reg == 18)
+    {
+        int voiceIndex = (reg - 4) / 7;
+        uint8_t previousGate = adsrState[voiceIndex] & GATE_BITMASK;
+        uint8_t newGate = value & GATE_BITMASK;
+
+        if (previousGate != newGate)
+        {
+            if (previousGate)
+            {
+                // Gate falling edge (note-off): enter Release phase
+                adsrState[voiceIndex] &= 0xFF - (GATE_BITMASK | ATTACK_BITMASK | DECAYSUSTAIN_BITMASK);
+            }
+            else
+            {
+                // Gate rising edge (note-on): enter Attack phase
+                adsrState[voiceIndex] = GATE_BITMASK | ATTACK_BITMASK | DECAYSUSTAIN_BITMASK;
+            }
+        }
+    }
+
+    SIDRegister[reg] = value;
 }
 
 /**
