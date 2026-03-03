@@ -2,6 +2,13 @@
 
 All notable changes to reSIDuEngine will be documented in this file.
 
+## [1.4.0] - 2026-03-04
+
+### Changed
+- Phase accumulator converted from `double` to `uint32_t` with 24-bit masking (`& 0xFFFFFF`), matching hardware behavior
+- Fractional phase carry (`phaseAccumulatorFrac`) preserves pitch accuracy when advancing the accumulator once per output sample
+- MSB rising-edge detection for hard sync now uses the XOR method `(~old & new) & 0x800000` for correct 0→1 transition detection
+
 ## [1.3.0] - 2026-02-12
 
 ### Fixed

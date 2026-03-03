@@ -22,6 +22,7 @@ cmake/
 *.swo
 *~
 .DS_Store
+notes.md
 
 # CMake files
 CMakeCache.txt

@@ -628,21 +628,26 @@ uint16_t combinedWF(int voiceIndex, const std::array<uint16_t, 4096>& waveformAr
     // ========================================================================
 
     /**
-     * Phase accumulator for each voice (24-bit precision stored as double).
+     * Phase accumulator for each voice (24-bit integer, matches hardware).
      * The phase accumulator is the heart of the oscillator - it's essentially a counter
      * that increments by the frequency value each CPU cycle and wraps around at 0xFFFFFF.
      * The upper bits of this accumulator are used to generate waveforms.
-     * We use double instead of uint32_t to preserve fractional precision and avoid
-     * quantization noise that would cause graininess at certain frequencies.
      */
-    std::array<double, SID_CHANNELS> phaseAccumulator;
+    std::array<uint32_t, SID_CHANNELS> phaseAccumulator;
 
     /**
-     * Previous phase accumulator value for each voice.
-     * Stored to detect wraparound (for hard sync) and MSB transitions (for noise clocking).
-     * Also stored as double to maintain precision for band-limiting calculations.
+     * Fractional carry for the phase accumulator.
+     * Because reSIDuEngine advances the accumulator once per output sample (not per CPU cycle),
+     * the per-sample increment (freq * clkRatio) is non-integer. The fractional part is
+     * accumulated here and carried into the integer accumulator each sample.
      */
-    std::array<double, SID_CHANNELS> previousAccumulator;
+    std::array<double, SID_CHANNELS> phaseAccumulatorFrac;
+
+    /**
+     * Previous phase accumulator value for each voice (24-bit integer).
+     * Stored to detect bit transitions needed for hard sync (MSB) and noise clocking (bit 19).
+     */
+    std::array<uint32_t, SID_CHANNELS> previousAccumulator;
 
     std::array<uint32_t, SID_CHANNELS> noiseLFSR;           ///< 23-bit LFSR state for noise generation (per voice)
     std::array<uint16_t, SID_CHANNELS> previousWFOut;       ///< Previous waveform output (for waveform 00 floating DAC emulation)

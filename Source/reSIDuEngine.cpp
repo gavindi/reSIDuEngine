@@ -70,6 +70,8 @@ SID::SID(double sampleRate, SIDModel model)
     voiceMuted.fill(false);
     // Zero-initialize all 32 SID registers
     SIDRegister.fill(0);
+    // Zero-initialize fractional accumulator carry
+    phaseAccumulatorFrac.fill(0.0);
 
     // Calculate the clock ratio: how many CPU cycles occur per audio sample
     // This is critical for pitch accuracy - it determines phase accumulator advancement
@@ -210,6 +212,7 @@ void SID::initSID()
         // Reset oscillator state
         phaseAccumulator[i] = 0;      // Current phase (0 to 0xFFFFFF)
         previousAccumulator[i] = 0;   // Previous phase (for detecting transitions)
+        phaseAccumulatorFrac[i] = 0.0; // Fractional carry
 
         // Reset noise generator to initial LFSR seed
         // 0x7FFFF8 is a non-zero seed that produces good pseudo-random sequences
@@ -726,20 +729,20 @@ float SID::processSID()
         }
         else
         {
-            // Normal operation: advance phase accumulator
-            // We use double precision to preserve fractional phase and avoid
-            // quantization noise that would cause graininess at certain frequencies
-            phaseAccumulator[voiceIndex] += accumulatorAdd;
-
-            // Wrap around at 24-bit boundary (0x1000000)
-            if (phaseAccumulator[voiceIndex] > 0xFFFFFF)
-                phaseAccumulator[voiceIndex] -= 0x1000000;
+            // Normal operation: advance phase accumulator.
+            // accumulatorAdd (freq * clkRatio) is non-integer, so we accumulate
+            // the fractional part separately and carry whole increments into
+            // the 24-bit integer accumulator each sample.
+            phaseAccumulatorFrac[voiceIndex] += accumulatorAdd;
+            uint32_t intAdd = static_cast<uint32_t>(phaseAccumulatorFrac[voiceIndex]);
+            phaseAccumulatorFrac[voiceIndex] -= intAdd;
+            phaseAccumulator[voiceIndex] = (phaseAccumulator[voiceIndex] + intAdd) & 0xFFFFFF;
         }
 
-        // Detect MSB transitions for hard sync
-        // The MSB is bit 23 (0x800000)
-        uint32_t MSB = static_cast<uint32_t>(phaseAccumulator[voiceIndex]) & 0x800000;
-        sourceMSBrise[voiceIndex] = (MSB > (static_cast<uint32_t>(previousAccumulator[voiceIndex]) & 0x800000)) ? 1 : 0;
+        // Detect MSB rising edge (bit 23: 0→1) for hard sync.
+        // (~old & new) isolates bits that were 0 in the previous sample and are 1 now.
+        uint32_t MSB = phaseAccumulator[voiceIndex] & 0x800000;
+        sourceMSBrise[voiceIndex] = ((~previousAccumulator[voiceIndex] & phaseAccumulator[voiceIndex]) & 0x800000) ? 1 : 0;
 
         uint16_t waveformOutput = 0;  // Waveform output (16-bit unsigned)
 
@@ -763,8 +766,8 @@ float SID::processSID()
 
             // Clock the LFSR when bit 19 transitions or when frequency is very high
             // Bit 19 (0x100000) serves as the clock input to the noise generator
-            if (((static_cast<uint32_t>(phaseAccumulator[voiceIndex]) & 0x100000) !=
-                 (static_cast<uint32_t>(previousAccumulator[voiceIndex]) & 0x100000)) ||
+            if (((phaseAccumulator[voiceIndex] & 0x100000) !=
+                 (previousAccumulator[voiceIndex] & 0x100000)) ||
                 accumulatorAdd >= 0x100000)
             {
                 // LFSR feedback polynomial: bits 22 and 17
@@ -814,7 +817,7 @@ float SID::processSID()
             if (pulseWidth > tmp) pulseWidth = tmp;
 
             // Get current phase (16-bit, upper bits of 24-bit accumulator)
-            tmp = static_cast<uint32_t>(phaseAccumulator[voiceIndex]) >> 8;
+            tmp = phaseAccumulator[voiceIndex] >> 8;
 
             if (waveformCTRL == PULSE_BITMASK)
             {
@@ -885,7 +888,7 @@ float SID::processSID()
                         // XOR phase with previous voice's MSB if ring mod is enabled
                         // For ring mod: voice 0 modulated by voice 2, voice 1 by voice 0, voice 2 by voice 1
                         int ringSource = (voiceIndex + 2) % SID_CHANNELS;
-                        tmp = static_cast<uint32_t>(phaseAccumulator[voiceIndex]) ^
+                        tmp = phaseAccumulator[voiceIndex] ^
                               (ctrl & RING_BITMASK ? sourceMSB[ringSource] : 0);
 
                         // Triangle waveform: fold phase at midpoint to create triangle shape
@@ -910,7 +913,7 @@ waveformOutput = waveformOutput ? reSIDuEngine::SID::combinedWF(voiceIndex, puls
             // Sawtooth is a linear ramp from 0 to 0xFFFF
             // It's simply the upper 16 bits of the 24-bit phase accumulator
 
-            waveformOutput = static_cast<uint32_t>(phaseAccumulator[voiceIndex]) >> 8;
+            waveformOutput = phaseAccumulator[voiceIndex] >> 8;
 
             if (waveformCTRL & TRI_BITMASK)
             {
@@ -950,7 +953,7 @@ waveformOutput = waveformOutput ? reSIDuEngine::SID::combinedWF(voiceIndex, puls
             int ringSource = (voiceIndex + 2) % SID_CHANNELS;
 
             // Apply ring modulation if enabled
-            tmp = static_cast<uint32_t>(phaseAccumulator[voiceIndex]) ^
+            tmp = phaseAccumulator[voiceIndex] ^
                   (ctrl & RING_BITMASK ? sourceMSB[ringSource] : 0);
 
             // Create triangle by folding: if MSB is set, invert all bits
