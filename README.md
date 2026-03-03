@@ -32,8 +32,8 @@ The implementation includes sophisticated modeling of how the SID's analog circu
 
 ### ADSR Envelope Generator
 Accurate envelope generation with:
-- Exponential decay curves
-- Proper rate counters and prescalers
+- Hardware-accurate 15-bit LFSR rate counter timing (periods derived by LFSR simulation, not approximation)
+- Exponential decay curves with hardware-measured threshold values (`0x5d`, `0x36`, `0x1a`, `0x0e`, `0x06`)
 - ADSR delay bug emulation for authentic sound
 - Hold-zero state handling
 
@@ -279,6 +279,13 @@ int numSamples = sid.clock(cpuCycles, buffer);
 
 ## Implementation Notes
 
+### Oscillator Phase Accumulator
+
+The phase accumulator is a 24-bit integer (`uint32_t`) with a `& 0xFFFFFF` mask on each
+update, matching the hardware's integer counter exactly. A separate `double` fractional carry
+preserves pitch accuracy when advancing the accumulator once per audio sample (rather than
+once per CPU cycle). MSB rising-edge detection for hard sync uses the XOR method
+`(~old & new) & 0x800000`, which correctly identifies the 0→1 transition of bit 23.
 
 ### Combined Waveforms
 
@@ -300,26 +307,29 @@ Traditional oversampling was too CPU-intensive, so a frequency-domain approach i
 
 ## Technical Details
 
-### ADSR Periods (in clock cycles)
+### ADSR Periods (in CPU clock cycles)
 
-| Rate | Cycles | Step |
-|------|--------|------|
-| 0    | 9      | ceil(9/9) |
-| 1    | 32     | 1 |
-| 2    | 63     | 1 |
-| 3    | 95     | 1 |
-| 4    | 149    | 1 |
-| 5    | 220    | 1 |
-| 6    | 267    | 1 |
-| 7    | 313    | 1 |
-| 8    | 392    | 1 |
-| 9    | 977    | 1 |
-| 10   | 1954   | 1 |
-| 11   | 3126   | 1 |
-| 12   | 3907   | 1 |
-| 13   | 11720  | 1 |
-| 14   | 19532  | 1 |
-| 15   | 31251  | 1 |
+Periods are computed by simulating the hardware 15-bit LFSR and counting clocks
+from the reset value (`0x7fff`) to the rate-specific comparison value.
+
+| Rate | Cycles | Approx. time (full 0→255 attack at PAL) |
+|------|--------|------------------------------------------|
+| 0    | 8      | ~2 ms   |
+| 1    | 31     | ~8 ms   |
+| 2    | 62     | ~16 ms  |
+| 3    | 94     | ~24 ms  |
+| 4    | 148    | ~38 ms  |
+| 5    | 219    | ~56 ms  |
+| 6    | 266    | ~68 ms  |
+| 7    | 312    | ~80 ms  |
+| 8    | 391    | ~100 ms |
+| 9    | 976    | ~250 ms |
+| 10   | 1953   | ~500 ms |
+| 11   | 3125   | ~800 ms |
+| 12   | 3906   | ~1 s    |
+| 13   | 11719  | ~3 s    |
+| 14   | 19531  | ~5 s    |
+| 15   | 31250  | ~8 s    |
 
 ### Frequency Calculation
 

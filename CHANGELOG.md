@@ -2,6 +2,14 @@
 
 All notable changes to reSIDuEngine will be documented in this file.
 
+## [1.5.0] - 2026-03-04
+
+### Changed
+- ADSR rate counter replaced with hardware-accurate 15-bit LFSR simulation: periods are now derived by counting LFSR clocks from 0x7fff to the rate-specific comparison value, matching the real SID timing circuit
+- ADSR rate counter now uses a `while` loop to fire multiple envelope steps per audio sample for fast rates (e.g. rate 0 fires ~3×/sample), eliminating missed steps at short periods
+- Exponential decay prescaler table corrected to hardware-measured thresholds (`0x5d`, `0x36`, `0x1a`, `0x0e`, `0x06`) and correct period assignments (high envelope = fast decay, low envelope = slow decay)
+- Removed `adsrStep` array; envelope always increments/decrements by 1 per LFSR firing, with fast rates handled by multiple firings per sample
+
 ## [1.4.0] - 2026-03-04
 
 ### Changed

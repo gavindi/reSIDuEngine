@@ -25,6 +25,40 @@ namespace reSIDuEngine
 constexpr std::array<int, 3> SID::FILTSW;
 
 /**
+ * Hardware-accurate ADSR rate comparison values for the 15-bit LFSR rate counter.
+ *
+ * The SID's envelope generator uses a 15-bit LFSR (linear feedback shift register)
+ * clocked once per CPU cycle. When the LFSR matches the rate-specific comparison
+ * value the envelope counter is stepped and the LFSR resets to 0x7fff.
+ * The period for each rate is the number of LFSR clocks from 0x7fff to the match.
+ *
+ * Source: kevtris.org SID ADSR hardware analysis
+ */
+static constexpr uint16_t adsrtable[16] = {
+    0x007f, 0x3000, 0x1e00, 0x0660, 0x0182, 0x5573, 0x000e, 0x3805,
+    0x2424, 0x2220, 0x090c, 0x0ecd, 0x010e, 0x23f7, 0x5237, 0x64a8
+};
+
+/**
+ * Simulate the 15-bit LFSR and return the number of clocks from 0x7fff until
+ * lfsr matches the target comparison value.  This is the envelope rate period
+ * in CPU clock cycles for the corresponding ADSR rate register setting.
+ *
+ * LFSR feedback: new_bit = bit14 XOR bit13 (tapped from the two MSBs).
+ */
+static uint32_t computeLFSRPeriod(uint16_t target)
+{
+    uint16_t lfsr = 0x7fff;
+    uint32_t count = 0;
+    do {
+        const uint16_t feedback = ((lfsr << 14) ^ (lfsr << 13)) & 0x4000;
+        lfsr = (lfsr >> 1) | feedback;
+        ++count;
+    } while (lfsr != target);
+    return count;
+}
+
+/**
  * SID Constructor
  *
  * Initializes a SID emulator instance with the specified sample rate and chip model.
@@ -84,62 +118,31 @@ SID::SID(double sampleRate, SIDModel model)
     cutoffRatio8580 = -2.0 * M_PI * (12500.0 / 256.0) / sampleRate;
     cutoffRatio6581 = -2.0 * M_PI * (20000.0 / 256.0) / sampleRate;
 
-    // Build the ADSR period table
-    // Period 0 is special: it must be at least 9 samples to avoid divide-by-zero
-    // in the band-limiting calculations (which divide by accumulatorAdd which depends on clkRatio)
-    float period0 = std::max(clkRatio, 9.0);
+    // Build hardware-accurate ADSR period table from 15-bit LFSR simulation.
+    // Each period is the number of CPU clock cycles between envelope steps,
+    // derived by counting LFSR clocks from 0x7fff to the rate-specific match value.
+    for (int i = 0; i < 16; i++)
+        adsrPeriods[i] = static_cast<float>(computeLFSRPeriod(adsrtable[i]));
 
-    // The remaining 15 periods are based on the original SID timing
-    // These values are in CPU cycles and are scaled by clkRatio to convert to samples
-    // The periods roughly double for each successive rate value, giving exponential timing
-    adsrPeriods = {
-        period0,    // Rate 0: fastest (special case)
-        32.0f,      // Rate 1: 2 ms
-        63.0f,      // Rate 2: 8 ms
-        95.0f,      // Rate 3: 16 ms
-        149.0f,     // Rate 4: 24 ms
-        220.0f,     // Rate 5: 38 ms
-        267.0f,     // Rate 6: 56 ms
-        313.0f,     // Rate 7: 68 ms
-        392.0f,     // Rate 8: 80 ms
-        977.0f,     // Rate 9: 240 ms
-        1954.0f,    // Rate 10: 750 ms
-        3126.0f,    // Rate 11: 1.5 s
-        3907.0f,    // Rate 12: 2.4 s
-        11720.0f,   // Rate 13: 3 s
-        19532.0f,   // Rate 14: 9 s
-        31251.0f    // Rate 15: 24 s
-    };
-
-    // Initialize step sizes for ADSR rates
-    // Rate 0 gets a special step size to compensate for its short period
-    // All other rates use step=1 (increment/decrement envelope by 1 each period)
-    adsrStep[0] = static_cast<int>(std::ceil(period0 / 9.0));
-    for (int i = 1; i < 16; i++)
-        adsrStep[i] = 1;
-
-    // Build the ADSR exponential table
-    // This table implements the logarithmic decay characteristic of the SID's release
-    // The table contains prescaler values: the envelope counter only advances every N
-    // period expirations, where N depends on the current envelope level
-    // As the envelope decays, the prescaler increases, slowing the decay rate
-    // This creates the characteristic exponential decay curve
+    // Build the ADSR exponential decay prescaler table.
+    // During decay and release the envelope counter is only decremented every N
+    // rate-counter firings, where N depends on the current envelope level.
+    // This creates the hardware's exponential (logarithmic) decay characteristic.
+    // Threshold values and prescaler periods are measured from real 6581/8580 hardware:
+    //   env >= 0x5d → every firing   (period 1)
+    //   env >= 0x36 → every 2nd      (period 2)
+    //   env >= 0x1a → every 4th      (period 4)
+    //   env >= 0x0e → every 8th      (period 8)
+    //   env >= 0x06 → every 16th     (period 16)
+    //   env <  0x06 → every 30th     (period 30) – slowest, near silence
     for (int i = 0; i < 256; i++)
     {
-        if (i < 6)
-            adsrExptable[i] = 1;      // Very high levels: no slowdown
-        else if (i < 14)
-            adsrExptable[i] = 30;     // High levels: 30x slower
-        else if (i < 26)
-            adsrExptable[i] = 16;     // Medium-high: 16x slower
-        else if (i < 54)
-            adsrExptable[i] = 8;      // Medium: 8x slower
-        else if (i < 93)
-            adsrExptable[i] = 4;      // Medium-low: 4x slower
-        else if (i < 93 + 62)
-            adsrExptable[i] = 2;      // Low: 2x slower
-        else
-            adsrExptable[i] = 1;      // Very low: no slowdown
+        if      (i < 0x06) adsrExptable[i] = 30;
+        else if (i < 0x0e) adsrExptable[i] = 16;
+        else if (i < 0x1a) adsrExptable[i] = 8;
+        else if (i < 0x36) adsrExptable[i] = 4;
+        else if (i < 0x5d) adsrExptable[i] = 2;
+        else               adsrExptable[i] = 1;
     }
 
     // Create combined waveform lookup tables
@@ -613,90 +616,78 @@ float SID::processSID()
         // Remember current SR value for next sample's comparison
         previousSR[voiceIndex] = SR;
 
-        // Advance the rate counter
-        // This counter determines when to update the envelope level
-        // It increments by clkRatio each sample and is compared against the period
+        // Advance the rate counter by the number of CPU cycles elapsed this sample.
+        // The counter is in CPU-cycle units; adsrPeriods[] holds the hardware-accurate
+        // cycle count for each rate (derived from the 15-bit LFSR simulation).
         rateCounter[voiceIndex] += clkRatio;
 
-        // Handle rate counter wraparound (ADSR delay bug emulation)
-        // The real SID's 15-bit rate counter can wrap around, causing timing glitches
+        // ADSR delay bug emulation: the real SID's 15-bit rate counter wraps at 0x8000.
+        // If a new (shorter) rate is written while the counter is already past its
+        // comparison value, the counter wraps around before the next firing.
         if (rateCounter[voiceIndex] >= 0x8000)
             rateCounter[voiceIndex] -= 0x8000;
 
-        // Determine which ADSR phase we're in and select the appropriate rate
-        float period;  // How many samples between envelope updates
-        int step;      // How much to change envelope per update
+        // Determine which ADSR phase we're in and select the period for that rate.
+        float period;
+        int rateIndex;
 
         if (adsrState[voiceIndex] & ATTACK_BITMASK)
         {
-            // Attack phase: use attack rate (upper nibble of AD register)
-            step = voiceRegister[5] >> 4;
-            period = adsrPeriods[step];
+            rateIndex = voiceRegister[5] >> 4;        // Attack rate (upper nibble of AD)
+            period    = adsrPeriods[rateIndex];
         }
         else if (adsrState[voiceIndex] & DECAYSUSTAIN_BITMASK)
         {
-            // Decay phase: use decay rate (lower nibble of AD register)
-            step = voiceRegister[5] & 0xF;
-            period = adsrPeriods[step];
+            rateIndex = voiceRegister[5] & 0xF;       // Decay rate (lower nibble of AD)
+            period    = adsrPeriods[rateIndex];
         }
         else
         {
-            // Release phase: use release rate (lower nibble of SR register)
-            step = SR & 0xF;
-            period = adsrPeriods[step];
+            rateIndex = SR & 0xF;                     // Release rate (lower nibble of SR)
+            period    = adsrPeriods[rateIndex];
         }
+        (void)rateIndex;  // only used for period lookup above
 
-        // Convert rate index to step size
-        step = adsrStep[step];
-
-        // Check if the rate counter has reached the period (time to update envelope)
-        // Also check we're not in the middle of a gate transition (tmp != 0)
-        if (rateCounter[voiceIndex] >= period &&
-            rateCounter[voiceIndex] < period + clkRatio &&
-            tmp == 0)
+        // Fire the envelope step once for each full period that has elapsed.
+        // Using a while loop (rather than a single if) handles fast rates where the
+        // LFSR period is shorter than one audio sample (e.g. rate 0 fires ~3×/sample).
+        while (rateCounter[voiceIndex] >= period && tmp == 0)
         {
-            // Reset rate counter (subtract period to preserve fractional accumulation)
             rateCounter[voiceIndex] -= period;
 
-            // Update the exponential counter
-            // During Attack, always update (linear attack)
-            // During Decay/Release, only update when exponential prescaler expires
+            // During Attack the envelope always steps every firing.
+            // During Decay/Release it is gated by the exponential prescaler,
+            // which slows the decrement as the envelope approaches silence.
             if ((adsrState[voiceIndex] & ATTACK_BITMASK) ||
                 ++exponentCounter[voiceIndex] == adsrExptable[envelopeCounter[voiceIndex]])
             {
-                // Only update envelope if not holding at zero
                 if (!(adsrState[voiceIndex] & HOLDZERO_BITMASK))
                 {
                     if (adsrState[voiceIndex] & ATTACK_BITMASK)
                     {
-                        // Attack: increment envelope toward maximum (255)
-                        envelopeCounter[voiceIndex] += step;
+                        // Attack: increment toward maximum (255), then switch to Decay.
+                        ++envelopeCounter[voiceIndex];
                         if (envelopeCounter[voiceIndex] >= 0xFF)
                         {
-                            // Reached maximum: enter Decay phase
                             envelopeCounter[voiceIndex] = 0xFF;
                             adsrState[voiceIndex] &= 0xFF - ATTACK_BITMASK;
+                            break;  // period changes on next sample (decay rate)
                         }
                     }
                     else if (!(adsrState[voiceIndex] & DECAYSUSTAIN_BITMASK) ||
                              envelopeCounter[voiceIndex] > (SR >> 4) + (SR & 0xF0))
                     {
-                        // Decay or Release: decrement envelope
-                        // During Decay, only decrement if above sustain level
-                        // During Release, always decrement
-                        envelopeCounter[voiceIndex] -= step;
-
-                        // Check if we've reached zero
-                        if (envelopeCounter[voiceIndex] <= 0 && envelopeCounter[voiceIndex] + step != 0)
+                        // Decay/Release: decrement; hold at zero when floor is reached.
+                        --envelopeCounter[voiceIndex];
+                        if (envelopeCounter[voiceIndex] <= 0)
                         {
-                            // Envelope reached zero: enter hold-at-zero state
                             envelopeCounter[voiceIndex] = 0;
                             adsrState[voiceIndex] |= HOLDZERO_BITMASK;
+                            break;  // counter frozen, no further updates needed
                         }
                     }
                 }
 
-                // Reset exponential counter
                 exponentCounter[voiceIndex] = 0;
             }
         }

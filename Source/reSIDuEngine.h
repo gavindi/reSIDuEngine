@@ -690,14 +690,6 @@ uint16_t combinedWF(int voiceIndex, const std::array<uint16_t, 4096>& waveformAr
     std::array<float, 16> adsrPeriods;
 
     /**
-     * ADSR step size lookup table.
-     * Determines how much to increment/decrement the envelope counter when the
-     * period expires. Most rates use step=1, but very fast attack rates may use
-     * larger steps to reach maximum quickly.
-     */
-    std::array<int, 16> adsrStep;
-
-    /**
      * ADSR exponential decay table.
      * The SID's decay and release stages are exponential (logarithmic), not linear.
      * This is achieved by slowing down the envelope counter as it decreases. This
