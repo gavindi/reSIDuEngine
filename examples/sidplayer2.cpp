@@ -742,6 +742,12 @@ void audio_callback(ma_device* pDevice, void* pOutput, const void* pInput, ma_ui
         if (sidInstance) {
             unsigned int cycles_per_sample = static_cast<unsigned int>(clk_ratio + 1.0);
             sidInstance->clock(cycles_per_sample, &sample);
+
+            // Sync read-only SID registers into memory so the CPU can read them.
+            // $D41B (OSC3) and $D41C (ENV3) are updated each sample by reSIDuEngine;
+            // without this, LDA $D41B in music code always returns 0.
+            memory[0xD41B] = sidInstance->read(0x1B);
+            memory[0xD41C] = sidInstance->read(0x1C);
         }
 
         // Scale to reduce volume and prevent clipping

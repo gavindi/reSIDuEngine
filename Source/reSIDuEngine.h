@@ -652,6 +652,10 @@ uint16_t combinedWF(int voiceIndex, const std::array<uint16_t, 4096>& waveformAr
     std::array<uint32_t, SID_CHANNELS> noiseLFSR;           ///< 23-bit LFSR state for noise generation (per voice)
     std::array<uint16_t, SID_CHANNELS> previousWFOut;       ///< Previous waveform output (for waveform 00 floating DAC emulation)
     std::array<uint16_t, SID_CHANNELS> previousWaveData;    ///< Previous combined waveform value (for interpolation)
+    std::array<float, SID_CHANNELS>    floatingOutputTTL;   ///< Bitfade countdown per voice (CPU cycles; 0 = inactive)
+    std::array<uint16_t, SID_CHANNELS> triSawPipeline;      ///< 8580 tri/saw one-sample OSC3 pipeline delay (power-up: 0x555)
+    uint8_t busValue;    ///< Capacitive data bus: last driven byte (decays to 0 after modelTTL cycles)
+    int     busValueTtl; ///< Bus TTL countdown in CPU cycles (0 = discharged)
 
     std::array<uint8_t, SID_CHANNELS> sourceMSBrise;  ///< Detected MSB rising edge (for sync, one per voice)
     std::array<uint32_t, SID_CHANNELS> sourceMSB;     ///< Previous voice's MSB (for ring mod/sync, one per voice)

@@ -2,6 +2,15 @@
 
 All notable changes to reSIDuEngine will be documented in this file.
 
+## [1.7.0] - 2026-03-05
+
+### Changed
+- Waveform floating-output decay (bitfade) implemented: when voice waveform bits are set to 0, `previousWFOut` now gradually decays (`output &= output >> 1`) rather than holding the last value indefinitely, matching the analog capacitor discharge behaviour of real hardware. Initial hold periods and fade intervals are chip-specific (MOS6581: 54 000 / 1 400 CPU cycles; MOS8580: 800 000 / 50 000 CPU cycles)
+- MOS8580 OSC3 readback delayed by one sample for triangle/sawtooth waveforms via a `triSawPipeline` register, matching the hardware's half-cycle output latency
+- Data bus capacitance modelled: `busValue` and `busValueTtl` track the last byte driven onto the SID data bus. Register writes refresh the TTL (MOS6581: 7 424 cycles; MOS8580: 663 552 cycles); reads of write-only registers return the decaying bus remnant and halve the remaining TTL; reads of OSC3/ENV3 refresh the TTL. Bus discharges to 0x00 when TTL expires
+- ENV3 register ($D41C) now reflects the envelope counter value from the start of the current sample (phi1 latch), matching the hardware timing where ENV3 is sampled before ADSR updates execute
+- `sidplayer2`: OSC3 ($D41B) and ENV3 ($D41C) register values are now synced from the emulator into `memory[]` after each audio sample, so C64 music code that reads these addresses (e.g. for random number generation or voice synchronisation) receives correct emulated values instead of zero
+
 ## [1.6.0] - 2026-03-04
 
 ### Changed

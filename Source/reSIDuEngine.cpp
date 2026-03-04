@@ -35,6 +35,17 @@ constexpr std::array<int, 3> SID::FILTSW;
  *
  * Source: kevtris.org SID ADSR hardware analysis
  */
+// Waveform floating-output TTL constants (CPU cycles, from libsidplayfp residfpII)
+// Initial hold period before first bitfade step; subsequent steps use FADE interval.
+static constexpr float FLOATING_OUTPUT_TTL_6581  =  54000.0f; // ~55 ms initial hold
+static constexpr float FLOATING_OUTPUT_FADE_6581 =   1400.0f; // ~1.4 ms between fade steps
+static constexpr float FLOATING_OUTPUT_TTL_8580  = 800000.0f; // ~812 ms initial hold
+static constexpr float FLOATING_OUTPUT_FADE_8580 =  50000.0f; // ~51 ms between fade steps
+
+// Data bus capacitance TTL constants (CPU cycles, from libsidplayfp residfpII)
+static constexpr int BUS_TTL_6581 = 0x01d00;  // 7424 cycles  (~7.5 ms at 985248 Hz)
+static constexpr int BUS_TTL_8580 = 0xa2000;  // 663552 cycles (~673 ms at 985248 Hz)
+
 static constexpr uint16_t adsrtable[16] = {
     0x007f, 0x3000, 0x1e00, 0x0660, 0x0182, 0x5573, 0x000e, 0x3805,
     0x2424, 0x2220, 0x090c, 0x0ecd, 0x010e, 0x23f7, 0x5237, 0x64a8
@@ -363,7 +374,13 @@ void SID::initSID()
         // Reset waveform history
         previousWFOut[i] = 0;         // For emulating floating DAC when waveform is 00
         previousWaveData[i] = 0;      // For combined waveform interpolation
+        floatingOutputTTL[i] = 0.0f;  // No bitfade in progress
+        triSawPipeline[i]    = 0x5550; // Hardware power-up state: 0x555 (12-bit) → 16-bit shifted
     }
+
+    // Initialize data bus capacitance state
+    busValue    = 0;
+    busValueTtl = 0;
 
     // Initialize filter state
     previousLowpass = 0;     // Lowpass integrator output
@@ -466,6 +483,10 @@ void SID::write(int addr, unsigned char value)
     // - Register offset (0-31) - reSIDfp API
     int reg = addr & 0x1F;
 
+    // All writes drive the data bus; track value and refresh capacitive TTL.
+    busValue    = value;
+    busValueTtl = (sidModel == MOS6581) ? BUS_TTL_6581 : BUS_TTL_8580;
+
     // Detect gate transitions immediately on control register writes.
     // Control registers: offset 4 (voice 0), 11 (voice 1), 18 (voice 2).
     // This ensures gate-off/gate-on sequences within a single sample
@@ -508,8 +529,21 @@ void SID::write(int addr, unsigned char value)
  */
 unsigned char SID::read(int addr)
 {
-    // Map address to register index (0-31)
-    return SIDRegister[addr & 0x1F];
+    const int reg = addr & 0x1F;
+    switch (reg)
+    {
+    case 0x1B:  // OSC3: voice 3 oscillator output (read-only)
+    case 0x1C:  // ENV3: voice 3 envelope output  (read-only)
+        // Reading a valid register drives the bus with its value and refreshes TTL.
+        busValue    = SIDRegister[reg];
+        busValueTtl = (sidModel == MOS6581) ? BUS_TTL_6581 : BUS_TTL_8580;
+        return busValue;
+    default:
+        // Write-only or unimplemented register: return the capacitive bus remnant.
+        // Reads of undriven registers discharge the bus faster (halve remaining TTL).
+        if (busValueTtl > 0) busValueTtl /= 2;
+        return busValue;
+    }
 }
 
 /**
@@ -706,6 +740,16 @@ float SID::processSID()
     // Select chip-model-specific DAC tables for this sample.
     const float* oscDAC = (sidModel == MOS6581) ? oscDAC6581.data() : oscDAC8580.data();
     const float* envDAC = (sidModel == MOS6581) ? envDAC6581.data() : envDAC8580.data();
+
+    // Snapshot ENV3 at start of sample (hardware latches envelope counter at phi1,
+    // before ADSR updates — so ENV3 register always reflects the previous sample's value).
+    const uint8_t env3Snapshot = static_cast<uint8_t>(envelopeCounter[2]);
+
+    // Age the data bus capacitance by this sample's CPU-cycle count.
+    if (busValueTtl > 0) {
+        busValueTtl -= static_cast<int>(clkRatio);
+        if (busValueTtl <= 0) { busValue = 0; busValueTtl = 0; }
+    }
 
     // Process all 3 voices
     for (int voiceIndex = 0; voiceIndex < SID_CHANNELS; voiceIndex++)
@@ -1102,10 +1146,29 @@ waveformOutput = waveformOutput ? reSIDuEngine::SID::combinedWF(voiceIndex, puls
         // -------------------------------------------------------------------
         // When no waveform is selected, the DAC holds its last value (floating)
         // This is used to create smooth transitions between waveforms
-        if (waveformCTRL)
-            previousWFOut[voiceIndex] = waveformOutput;  // Update held value
-        else
-            waveformOutput = previousWFOut[voiceIndex];  // Use previously held value
+        if (waveformCTRL) {
+            previousWFOut[voiceIndex]     = waveformOutput;
+            floatingOutputTTL[voiceIndex] = 0.0f;  // Cancel any active bitfade
+        } else {
+            // Waveform=00: floating DAC holds last value, bits decay over time (hardware bitfade).
+            // The first fade step is delayed by FLOATING_OUTPUT_TTL cycles; subsequent steps by FLOATING_OUTPUT_FADE.
+            float& ttl = floatingOutputTTL[voiceIndex];
+            const float initialTTL = (sidModel == MOS6581) ? FLOATING_OUTPUT_TTL_6581 : FLOATING_OUTPUT_TTL_8580;
+            const float fadeTTL    = (sidModel == MOS6581) ? FLOATING_OUTPUT_FADE_6581 : FLOATING_OUTPUT_FADE_8580;
+
+            if (ttl == 0.0f && previousWFOut[voiceIndex] != 0)
+                ttl = initialTTL;  // Start countdown on first sample with waveform=00
+
+            if (ttl > 0.0f) {
+                ttl -= static_cast<float>(clkRatio);
+                if (ttl <= 0.0f) {
+                    // Apply one bitfade step: right-shift AND with self
+                    previousWFOut[voiceIndex] &= (previousWFOut[voiceIndex] >> 1);
+                    ttl = (previousWFOut[voiceIndex] != 0) ? fadeTTL : 0.0f;
+                }
+            }
+            waveformOutput = previousWFOut[voiceIndex];
+        }
 
         // Store current phase for next sample's calculations
         previousAccumulator[voiceIndex] = phaseAccumulator[voiceIndex];
@@ -1148,11 +1211,20 @@ waveformOutput = waveformOutput ? reSIDuEngine::SID::combinedWF(voiceIndex, puls
     // Voice 3's oscillator and envelope can be read back for various purposes
     // (random number generation, music synchronization, etc.)
 
-    // Update oscillator 3 register (upper 8 bits of waveform output)
-    SIDRegister[0x1B] = previousWFOut[2] >> 8;
+    // OSC3 ($D41B): upper 8 bits of voice 3 waveform output.
+    // On MOS8580, triangle/sawtooth waveforms are pipelined — OSC3 readback is delayed
+    // one sample to match the hardware's half-cycle output latency.
+    if (sidModel == MOS8580 && (SIDRegister[0x12] & (TRI_BITMASK | SAW_BITMASK))) {
+        // Use the pipeline-delayed value; update pipeline with current output.
+        SIDRegister[0x1B] = static_cast<uint8_t>(triSawPipeline[2] >> 8);
+        triSawPipeline[2] = previousWFOut[2];
+    } else {
+        SIDRegister[0x1B] = static_cast<uint8_t>(previousWFOut[2] >> 8);
+    }
 
-    // Update envelope 3 register (current ADSR level)
-    SIDRegister[0x1C] = envelopeCounter[2];
+    // ENV3 ($D41C): envelope counter latched at phi1 (start of clock cycle).
+    // env3Snapshot was captured before ADSR updates this sample, matching hardware timing.
+    SIDRegister[0x1C] = env3Snapshot;
 
     // =========================================================================
     // EXTERNAL AUDIO INPUT (EXT IN)
