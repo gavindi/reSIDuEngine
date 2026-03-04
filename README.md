@@ -13,6 +13,7 @@ The implementation focuses on:
 - **Band-limited waveform synthesis** to reduce aliasing at high frequencies
 - **Combined waveform support** modeling the analog behavior of the SID chip
 - **Bi-quadratic filter** implementation for lowpass, bandpass, and highpass modes
+- **Hardware-accurate DAC nonlinearity** for oscillator, envelope, and filter cutoff paths
 - **Noise generator** using a 23-bit LFSR
 - **Sync and ring modulation** between voices
 - **reSIDfp API compatibility** for easy migration from reSIDfp
@@ -37,13 +38,21 @@ Accurate envelope generation with:
 - ADSR delay bug emulation for authentic sound
 - Hold-zero state handling
 
+### DAC Nonlinearity
+All three SID DAC paths are modelled as chip-specific R-2R ladder networks (ported from the residfpII circuit model), replacing the ideal linear conversion used in simpler emulators:
+- **Oscillator DAC** (12-bit): chip-specific R-2R nonlinearity; MOS6581 additionally applies a cubic NMOS source-follower saturation model, adding harmonic distortion at higher amplitudes
+- **Envelope DAC** (8-bit): chip-specific R-2R nonlinearity; lower envelope levels decay with a slightly different shape than ideal
+- **Filter cutoff DAC** (11-bit): chip-specific R-2R nonlinearity mapped to the SVF coefficient
+
 ### Filter
-Two-integrator loop bi-quadratic filter supporting:
-- Lowpass, bandpass, and highpass modes
-- Resonance control
+Two-integrator loop state-variable filter supporting:
+- Lowpass, bandpass, and highpass modes (combinable)
+- Hardware-accurate cutoff mapping via R-2R ladder DAC simulation (per chip model)
+- Hardware-measured resonance feedback formula per chip model
 - Per-voice filter routing
 - External audio input (EXT IN) routing
-- Separate 6581 and 8580 cutoff curves
+- External RC output stage: ~16 kHz lowpass + ~1.6 Hz highpass for DC removal
+- Soft-clip on final output to prevent harsh digital peaks at high resonance or volume
 
 ### Anti-Aliasing
 Special band-limiting techniques for pulse and sawtooth waveforms:
@@ -279,6 +288,28 @@ int numSamples = sid.clock(cpuCycles, buffer);
 
 ## Implementation Notes
 
+### DAC Nonlinearity Implementation
+
+All three SID DAC paths use the same `buildKinkedDacTable()` function (ported from the residfpII `Dac::kinkedDac()` circuit model), which simulates the R-2R resistor ladder by repeated parallel substitution. The key chip-specific parameters are:
+
+| Parameter | MOS6581 | MOS8580 |
+|---|---|---|
+| 2R/R ratio | 2.20 | 2.00 |
+| Bit-0 termination | Missing | Present |
+| MOSFET leakage | 0.0075 | 0.0035 |
+| NMOS saturation | Yes (cubic) | No |
+
+**Oscillator DAC** (12-bit, 4096 entries): The waveform output's upper 12 bits index a precomputed table. Values are centered at the DAC midpoint and scaled to ±32767. For MOS6581, a cubic saturation curve (`V' = 1.1V − 0.121V³`) is applied after the R-2R calculation, modelling the NMOS source-follower output stage.
+
+**Envelope DAC** (8-bit, 256 entries): The 8-bit envelope counter indexes a precomputed table normalized to [0, 1]. The nonlinear bit weights mean lower envelope levels have a slightly compressed response compared to ideal.
+
+**Filter cutoff DAC** (11-bit, 2048 entries): The 11-bit FC register indexes a precomputed table of SVF cutoff coefficients. For MOS6581, the missing bit-0 termination compresses the low FC range; the table is monotonized post-construction since real hardware smooths the raw non-monotonicity analogically. The MOS8580 table produces a near-linear response.
+
+After the SVF, the output passes through a two-stage RC model of the C64's audio output stage:
+- **Lowpass ~16 kHz** (10 kΩ / 1000 pF): transparent at audio rates, removes near-Nyquist content
+- **Highpass ~1.6 Hz** (10 kΩ / 10 µF): removes DC drift from the filter integrators
+- **Soft-clip**: `tanh`-based compression above ±1.0 (headroom 0.5) prevents harsh digital peaks
+
 ### Oscillator Phase Accumulator
 
 The phase accumulator is a 24-bit integer (`uint32_t`) with a `& 0xFFFFFF` mask on each
@@ -347,13 +378,19 @@ For NTSC systems: clock = 1022727 Hz
 Both MOS6581 (original) and MOS8580 (revised) chip models are supported:
 
 **MOS6581:**
-- Warmer, darker filter sound
-- Non-linear filter cutoff with dead zone
+- Warmer, darker sound with harmonic distortion from NMOS source-follower saturation on the oscillator output
+- Oscillator DAC: kinked R-2R (2R/R=2.20, missing bit-0 termination) + cubic saturation
+- Envelope DAC: kinked R-2R (2R/R=2.20), non-linear amplitude scaling
+- Filter cutoff DAC: same kinked R-2R; compresses the low end of the FC range, creating a natural dead zone
+- Resonance feedback = `(~res & 0xf) / 8.0` (hardware-measured), clamped at Q≈3.3 maximum
 - Combined waveforms use 11-bit output (MSB masked)
 
 **MOS8580:**
-- Brighter, cleaner filter sound
-- More linear filter cutoff (no dead zone)
+- Brighter, cleaner sound; no oscillator saturation
+- Oscillator DAC: near-ideal R-2R (2R/R=2.00, proper termination)
+- Envelope DAC: near-ideal R-2R (2R/R=2.00), near-linear amplitude scaling
+- Filter cutoff DAC: near-ideal R-2R, full FC range usable
+- Resonance feedback = `pow(2, (4 - res) / 8)`, Q range 0.71–2.59
 - Combined waveforms use full 12-bit output
 
 Select chip model in constructor or use `setChipModel()` / `setModel()`.

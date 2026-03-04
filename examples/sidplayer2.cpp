@@ -735,7 +735,7 @@ void audio_callback(ma_device* pDevice, void* pOutput, const void* pInput, ma_ui
             CPUtime -= clk_ratio;
         }
 
-        // Generate audio sample from reSIDuEngine using reSIDfp-compatible API
+        // Generate audio sample
         // Pass enough cycles to ensure we get exactly 1 sample
         // Adding 1.0 ensures cycles/clkRatio >= 1.0 after integer conversion
         short sample = 0;

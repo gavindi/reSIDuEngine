@@ -426,7 +426,7 @@ public:
     void setFramerate(double hz);
 
     // ========================================================================
-    // reSIDfp API Compatibility Methods
+    // Extended API Methods
     // ========================================================================
 
     /**
@@ -477,9 +477,9 @@ public:
     void mute(int channel, bool enable);
 
     /**
-     * Set the SID chip model (reSIDfp API name).
+     * Set the SID chip model (alias for setModel()).
      *
-     * This is an alias for setModel() to provide exact reSIDfp API compatibility.
+     * This is an alias for setModel() to provide reSIDfp API compatibility.
      * Changes the chip model between MOS6581 (original) and MOS8580 (revised).
      *
      * @param model The chip model to emulate (MOS6581 or MOS8580)
@@ -487,9 +487,9 @@ public:
     void setChipModel(SIDModel model) { setModel(model); }
 
     /**
-     * Get the currently configured SID chip model (reSIDfp API name).
+     * Get the currently configured SID chip model (alias for getModel()).
      *
-     * This is an alias for getModel() to provide exact reSIDfp API compatibility.
+     * This is an alias for getModel() to provide reSIDfp API compatibility.
      *
      * @return The current chip model being emulated (MOS6581 or MOS8580)
      */
@@ -595,12 +595,12 @@ uint16_t combinedWF(int voiceIndex, const std::array<uint16_t, 4096>& waveformAr
     float volume;                ///< Master volume multiplier (1.0 = normal)
 
     // ========================================================================
-    // Member Variables - reSIDfp API Compatibility
+    // Member Variables - Extended API State
     // ========================================================================
 
-    bool filterEnabled;                         ///< Filter enable/disable flag (reSIDfp compatibility)
-    std::array<bool, SID_CHANNELS> voiceMuted;  ///< Per-voice mute flags (reSIDfp compatibility)
-    int externalInput;                          ///< External audio input sample (EXT IN, reSIDfp compatibility)
+    bool filterEnabled;                         ///< Filter enable/disable flag
+    std::array<bool, SID_CHANNELS> voiceMuted;  ///< Per-voice mute flags
+    int externalInput;                          ///< External audio input sample (EXT IN)
 
     // ========================================================================
     // Member Variables - Memory
@@ -662,8 +662,16 @@ uint16_t combinedWF(int voiceIndex, const std::array<uint16_t, 4096>& waveformAr
 
     float previousLowpass;                  ///< Previous lowpass filter output
     float previousBandpass;                 ///< Previous bandpass filter output
-    double cutoffRatio8580;             ///< Precalculated cutoff coefficient for 8580 chip model
-    double cutoffRatio6581;             ///< Precalculated cutoff coefficient for 6581 chip model
+    std::array<float, 2048> fcCutoffTable6581; ///< FC register → cutoff coefficient (6581 kinked DAC)
+    std::array<float, 2048> fcCutoffTable8580; ///< FC register → cutoff coefficient (8580 linear DAC)
+    std::array<float, 4096> oscDAC6581; ///< Osc waveform DAC (6581: kinked R-2R + NMOS saturation)
+    std::array<float, 4096> oscDAC8580; ///< Osc waveform DAC (8580: kinked R-2R, no saturation)
+    std::array<float, 256>  envDAC6581; ///< Envelope DAC (6581: kinked R-2R)
+    std::array<float, 256>  envDAC8580; ///< Envelope DAC (8580: kinked R-2R)
+    float externalLowpass;   ///< External RC low-pass state  (16 kHz)
+    float externalHighpass;  ///< External RC high-pass state (1.6 Hz)
+    float w0lp;              ///< External LP coefficient (computed at init)
+    float w0hp;              ///< External HP coefficient (computed at init)
 
     // ========================================================================
     // Member Variables - Combined Waveform Lookup Tables

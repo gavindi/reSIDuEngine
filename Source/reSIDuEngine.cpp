@@ -10,6 +10,7 @@
 #include "reSIDuEngine.h"
 #include <cstring>
 #include <algorithm>
+#include <vector>
 
 namespace reSIDuEngine
 {
@@ -59,6 +60,65 @@ static uint32_t computeLFSRPeriod(uint16_t target)
 }
 
 /**
+ * Build a normalized R-2R ladder DAC lookup table.
+ * out[i] is in [0,1] representing the analog output for digital input i.
+ * rRatio: 2R/R ratio (2.20 for MOS6581, 2.00 for MOS8580)
+ * hasTerm: whether bit 0 has a termination resistor (false for MOS6581)
+ * leakage: sub-threshold MOSFET leakage fraction (0.0075 / 0.0035)
+ */
+static void buildKinkedDacTable(double* out, int bits,
+                                double rRatio, bool hasTerm, double leakage)
+{
+    constexpr double R_INFINITY = 1e6;
+    const double _2R = rRatio;       // normalized R = 1.0
+    std::vector<double> dac(bits);
+    double Vsum = 0.0;
+
+    for (int set_bit = 0; set_bit < bits; set_bit++)
+    {
+        double Vn = 1.0;
+        double R  = 1.0;
+        double Rn = hasTerm ? _2R : R_INFINITY;
+
+        // Build "tail" resistance by repeated parallel substitution
+        for (int bit = 0; bit < set_bit; bit++)
+            Rn = (Rn == R_INFINITY) ? R + _2R : R + (_2R * Rn) / (_2R + Rn);
+
+        // Source transformation for bit voltage
+        if (Rn == R_INFINITY) {
+            Rn = _2R;
+        } else {
+            Rn = (_2R * Rn) / (_2R + Rn);
+            Vn = Vn * Rn / _2R;
+        }
+
+        // Propagate to output
+        for (int bit = set_bit + 1; bit < bits; bit++) {
+            Rn += R;
+            const double I = Vn / Rn;
+            Rn = (_2R * Rn) / (_2R + Rn);
+            Vn = Rn * I;
+        }
+
+        dac[set_bit] = Vn;
+        Vsum += Vn;
+    }
+
+    // Normalize and accumulate into output table for each input value
+    for (int i = 0; i < bits; i++)
+        dac[i] /= Vsum;
+
+    const int tableSize = 1 << bits;
+    for (int input = 0; input < tableSize; input++)
+    {
+        double val = 0.0;
+        for (int i = 0; i < bits; i++)
+            val += ((input >> i) & 1) ? dac[i] : dac[i] * leakage;
+        out[input] = val;
+    }
+}
+
+/**
  * SID Constructor
  *
  * Initializes a SID emulator instance with the specified sample rate and chip model.
@@ -99,6 +159,8 @@ SID::SID(double sampleRate, SIDModel model)
     , externalInput(0)
     , previousLowpass(0)
     , previousBandpass(0)
+    , externalLowpass(0.0f)
+    , externalHighpass(0.0f)
 {
     // Initialize voice mute flags (all voices unmuted by default)
     voiceMuted.fill(false);
@@ -111,12 +173,89 @@ SID::SID(double sampleRate, SIDModel model)
     // This is critical for pitch accuracy - it determines phase accumulator advancement
     updateClockRatio();
 
-    // Precalculate filter cutoff ratios for both chip models
-    // These are used in the bi-quad filter equations and depend on sample rate
-    // 8580: cutoff range approximately 0-12.5 kHz
-    // 6581: cutoff range approximately 0-20 kHz (but with non-linear behavior)
-    cutoffRatio8580 = -2.0 * M_PI * (12500.0 / 256.0) / sampleRate;
-    cutoffRatio6581 = -2.0 * M_PI * (20000.0 / 256.0) / sampleRate;
+    // Build hardware-accurate FC cutoff coefficient tables via kinked DAC simulation.
+    // The 11-bit FC register indexes into an R-2R ladder DAC; DAC output (normalized
+    // 0-1) is used to drive the exponential filter coefficient formula.
+    // 6581: 2R/R=2.20, missing bit-0 termination (creates dead zone at low FC)
+    // 8580: 2R/R=2.00, proper termination (nearly linear)
+    {
+        std::vector<double> dac6581(2048), dac8580(2048);
+        buildKinkedDacTable(dac6581.data(), 11, 2.20, false, 0.0075);
+        buildKinkedDacTable(dac8580.data(), 11, 2.00, true,  0.0035);
+
+        // Max cutoff Hz per chip model (controls the frequency at FC=2047).
+        // 6581: 16 kHz matches hardware-measured upper bound and calibrates the
+        //   exponential coefficient to produce the same mid-range cutoff as the
+        //   old formula (within ~1% at FC_HI=100).
+        // 8580: 12.5 kHz is identical to the old formula's effective maximum.
+        const double maxHz6581 = 16000.0;
+        const double maxHz8580 = 12500.0;
+        const double ratio6581 = -2.0 * M_PI * maxHz6581 / sampleRate;
+        const double ratio8580 = -2.0 * M_PI * maxHz8580 / sampleRate;
+
+        for (int fc = 0; fc < 2048; fc++) {
+            fcCutoffTable6581[fc] = static_cast<float>(1.0 - std::exp(dac6581[fc] * ratio6581));
+            fcCutoffTable8580[fc] = static_cast<float>(1.0 - std::exp(dac8580[fc] * ratio8580));
+        }
+
+        // The 6581 R-2R DAC is non-monotonic: bits 0-2 have similar weights due to the
+        // missing bit-0 termination, so fc=7→8 (FC_LO roll-over) briefly drops the
+        // cutoff. Real hardware smooths this analogically; our digital SVF cannot, so
+        // we enforce monotonicity to prevent audible bumps in filter sweeps.
+        float prev = 0.0f;
+        for (int fc = 0; fc < 2048; fc++) {
+            fcCutoffTable6581[fc] = std::max(fcCutoffTable6581[fc], prev);
+            prev = fcCutoffTable6581[fc];
+        }
+    }
+
+    // External RC filter coefficients (models C64 audio output stage):
+    //   LP: R=10 kΩ, C=1000 pF → ~16 kHz  (near-transparent at audio rates)
+    //   HP: R=10 kΩ, C=10 µF  → ~1.6 Hz   (removes DC offset from filter integrators)
+    {
+        const double dt = 1.0 / sampleRate;
+        w0lp = static_cast<float>(dt / (dt + 10e3 * 1000e-12));
+        w0hp = static_cast<float>(dt / (dt + 10e3 * 10e-6));
+    }
+
+    // Build oscillator waveform DAC tables (12-bit, 4096 entries per chip model).
+    // waveformOutput is 16-bit; upper 12 bits (>> 4) index these tables.
+    // Values are centered at the DAC midpoint and scaled to match the existing
+    // signal range (~[-32768, +32767]), so only the nonlinear shape changes.
+    {
+        std::vector<double> raw(4096);
+
+        // 6581: kinked R-2R + cubic NMOS source-follower saturation model.
+        // Saturation: V' = GAIN*V + (1-GAIN)*SAT*V^3  (residfpII Dac::getOutput, saturate=true)
+        buildKinkedDacTable(raw.data(), 12, 2.20, false, 0.0075);
+        {
+            constexpr double GAIN = 1.1, SAT = 1.1;
+            auto saturate = [&](double v) {
+                return GAIN * v + (1.0 - GAIN) * SAT * v * v * v;
+            };
+            const double offset = saturate(raw[0x7FF]);
+            for (int i = 0; i < 4096; i++)
+                oscDAC6581[i] = static_cast<float>((saturate(raw[i]) - offset) * 65535.0);
+        }
+
+        // 8580: ideal kinked R-2R, no saturation.
+        buildKinkedDacTable(raw.data(), 12, 2.00, true, 0.0035);
+        {
+            const double offset = raw[0x7FF];
+            for (int i = 0; i < 4096; i++)
+                oscDAC8580[i] = static_cast<float>((raw[i] - offset) * 65535.0);
+        }
+    }
+
+    // Build envelope DAC tables (8-bit, 256 entries per chip model).
+    // Output is normalized to [0, 1]; envDAC[255] == 1.0 matches the prior 255/256.0 max.
+    {
+        std::vector<double> raw(256);
+        buildKinkedDacTable(raw.data(), 8, 2.20, false, 0.0075);  // 6581
+        for (int i = 0; i < 256; i++) envDAC6581[i] = static_cast<float>(raw[i]);
+        buildKinkedDacTable(raw.data(), 8, 2.00, true,  0.0035);  // 8580
+        for (int i = 0; i < 256; i++) envDAC8580[i] = static_cast<float>(raw[i]);
+    }
 
     // Build hardware-accurate ADSR period table from 15-bit LFSR simulation.
     // Each period is the number of CPU clock cycles between envelope steps,
@@ -229,6 +368,8 @@ void SID::initSID()
     // Initialize filter state
     previousLowpass = 0;     // Lowpass integrator output
     previousBandpass = 0;    // Bandpass integrator output
+    externalLowpass  = 0.0f; // External RC lowpass state
+    externalHighpass = 0.0f; // External RC highpass state
 
     // Reset external audio input (EXT IN)
     externalInput = 0;
@@ -561,6 +702,10 @@ float SID::processSID()
 {
     float filterInput = 0;   // Accumulator for signals routed to filter
     float output = 0;        // Accumulator for final output (filtered + unfiltered)
+
+    // Select chip-model-specific DAC tables for this sample.
+    const float* oscDAC = (sidModel == MOS6581) ? oscDAC6581.data() : oscDAC8580.data();
+    const float* envDAC = (sidModel == MOS6581) ? envDAC6581.data() : envDAC8580.data();
 
     // Process all 3 voices
     for (int voiceIndex = 0; voiceIndex < SID_CHANNELS; voiceIndex++)
@@ -974,21 +1119,25 @@ waveformOutput = waveformOutput ? reSIDuEngine::SID::combinedWF(voiceIndex, puls
         // Each voice can be routed either to the filter or directly to output
         // The routing is controlled by the filter routing register (0xD417)
 
-        // Check if this voice is muted (reSIDfp API compatibility)
+        // Check if this voice is muted
         if (!voiceMuted[voiceIndex])
         {
-            // Convert waveform from unsigned (0-65535) to signed (-32768 to +32767)
-            // Then scale by envelope (0-255) to apply amplitude control
+            // Apply chip-specific DAC nonlinearity to waveform and envelope.
+            // waveformOutput upper 12 bits (>> 4) index the 4096-entry oscDAC table;
+            // envelopeCounter (0-255) indexes the 256-entry envDAC table.
+            // oscDAC values are centered (midpoint → 0) and scaled to ~[-32768, +32767].
+            // envDAC values are normalized to [0, 1].
+            const float voiceOut = oscDAC[waveformOutput >> 4] * envDAC[envelopeCounter[voiceIndex]];
             if (SIDRegister[0x17] & FILTSW[voiceIndex])
             {
                 // Route to filter input
-                filterInput += (waveformOutput - 0x8000) * (envelopeCounter[voiceIndex] / 256.0);
+                filterInput += voiceOut;
             }
             else if (voiceIndex != 2 || !(SIDRegister[0x18] & OFF3_BITMASK))
             {
                 // Route directly to output (bypassing filter)
                 // Exception: Voice 3 can be muted with the OFF3 bit
-                output += (waveformOutput - 0x8000) * (envelopeCounter[voiceIndex] / 256.0);
+                output += voiceOut;
             }
         }
     }
@@ -1035,39 +1184,32 @@ waveformOutput = waveformOutput ? reSIDuEngine::SID::combinedWF(voiceIndex, puls
     // that can simultaneously produce lowpass, bandpass, and highpass outputs
     // The user selects which mode(s) to mix into the final output
 
-    // Check if filter is enabled (reSIDfp API compatibility)
+    // Check if filter is enabled
     if (filterEnabled)
     {
-        // Calculate filter cutoff frequency from 11-bit cutoff register
-        // Cutoff is stored in registers 0x15 (lower 3 bits) and 0x16 (upper 8 bits)
-        double cutoff = (SIDRegister[0x15] & 7) / 8.0 + SIDRegister[0x16] + 0.2;
+        // 11-bit FC value from registers: FC_HI (upper 8) | FC_LO (lower 3)
+        const int fc = (SIDRegister[0x16] << 3) | (SIDRegister[0x15] & 0x07);
+        const double cutoff = (sidModel == MOS8580)
+            ? fcCutoffTable8580[fc]
+            : fcCutoffTable6581[fc];
 
-        double resonance;  // Filter resonance (Q factor)
-
-        if (sidModel == MOS8580)
-        {
-            // 8580 filter: more linear, better behaved
-            // Cutoff range approximately 0-12.5 kHz
-            cutoff = 1.0 - std::exp(cutoff * cutoffRatio8580);
-
-            // Resonance from 4-bit value (upper nibble of register 0x17)
-            // Maps approximately to Q from 0.707 to 8.0
-            resonance = std::pow(2.0, (4.0 - (SIDRegister[0x17] >> 4)) / 8.0);
+        // Resonance feedback gain (4-bit value, upper nibble of RES_FILT register)
+        const int res = SIDRegister[0x17] >> 4;
+        double resonance;
+        if (sidModel == MOS8580) {
+            // 8580: exponential approximation of the Rf/Ri resistor-ladder circuit
+            resonance = std::pow(2.0, (4.0 - res) / 8.0);
+        } else {
+            // 6581: feedback gain = (~res & 0xf) / 8.0  (hardware-measured)
+            // res=0  → 1.875 (heavily damped), res=15 → 0 (self-oscillates)
+            const int inv_res = (~res) & 0xf;
+            resonance = inv_res / 8.0;
         }
-        else
-        {
-            // 6581 filter: more quirky, with non-linear low end
-            // Cutoff range approximately 0-20 kHz but with dead zone at low settings
-            if (cutoff < 24)
-                cutoff = 0.035;  // Dead zone: very low cutoff values produce minimal filtering
-            else
-                cutoff = 1.0 - 1.263 * std::exp(cutoff * cutoffRatio6581);
-
-            // Resonance behavior is different on 6581
-            // High resonance values can cause filter oscillation
-            resonance = (SIDRegister[0x17] > 0x5F) ?
-                        8.0 / (SIDRegister[0x17] >> 4) : 1.41;
-        }
+        // Clamp to prevent SVF divergence. The 6581 hardware self-oscillates at
+        // res=15 (resonance=0), but our simple SVF goes unstable at values below
+        // ~0.3. Clamping at 0.3 (Q≈3.3) gives audible strong resonance without
+        // numerical instability.
+        if (resonance < 0.3) resonance = 0.3;
 
         // Two-integrator-loop filter implementation
         // This creates a state-variable filter with simultaneous LP/BP/HP outputs
@@ -1117,7 +1259,23 @@ waveformOutput = waveformOutput ? reSIDuEngine::SID::combinedWF(voiceIndex, puls
     // The /15.0 from master volume brings it to approximately ±0.1 to ±1.5
     // depending on the volume setting (0-15)
 
-    return static_cast<float>((output / 0x10000) * (SIDRegister[0x18] & 0xF) / 15.0);
+    // Scale output
+    float result = static_cast<float>((output / 0x10000) * (SIDRegister[0x18] & 0xF) / 15.0f);
+
+    // External RC filter: LP at ~16 kHz (near-transparent), HP at ~1.6 Hz (DC removal)
+    externalLowpass  += w0lp * (result      - externalLowpass);
+    externalHighpass += w0hp * (externalLowpass - externalHighpass);
+    result = externalLowpass - externalHighpass;
+
+    // Soft clipping: tanh-based compression above ±1.0 to prevent harsh digital peaks
+    constexpr float CLIP_THRESHOLD = 1.0f;
+    constexpr float CLIP_HEADROOM  = 0.5f;
+    if (result > CLIP_THRESHOLD)
+        result = CLIP_THRESHOLD + CLIP_HEADROOM * std::tanh((result - CLIP_THRESHOLD) / CLIP_HEADROOM);
+    else if (result < -CLIP_THRESHOLD)
+        result = -CLIP_THRESHOLD - CLIP_HEADROOM * std::tanh((-result - CLIP_THRESHOLD) / CLIP_HEADROOM);
+
+    return result;
 }
 
 /**
@@ -1184,7 +1342,7 @@ float SID::clockSample()
 }
 
 // ============================================================================
-// reSIDfp API Compatibility Methods
+// Extended API Methods
 // ============================================================================
 
 /**
@@ -1212,9 +1370,28 @@ void SID::setSamplingParameters(double clockFrequency, int /*method*/,
     // Recalculate clock ratio and timing
     updateClockRatio();
 
-    // Recalculate filter coefficients for the new sample rate
-    cutoffRatio8580 = -2.0 * M_PI * (12500.0 / 256.0) / sampleRate;
-    cutoffRatio6581 = -2.0 * M_PI * (20000.0 / 256.0) / sampleRate;
+    // Rebuild hardware-accurate FC cutoff coefficient tables for the new sample rate
+    {
+        std::vector<double> dac6581(2048), dac8580(2048);
+        buildKinkedDacTable(dac6581.data(), 11, 2.20, false, 0.0075);
+        buildKinkedDacTable(dac8580.data(), 11, 2.00, true,  0.0035);
+        const double maxHz6581 = 16000.0;
+        const double maxHz8580 = 12500.0;
+        const double ratio6581 = -2.0 * M_PI * maxHz6581 / sampleRate;
+        const double ratio8580 = -2.0 * M_PI * maxHz8580 / sampleRate;
+        for (int fc = 0; fc < 2048; fc++) {
+            fcCutoffTable6581[fc] = static_cast<float>(1.0 - std::exp(dac6581[fc] * ratio6581));
+            fcCutoffTable8580[fc] = static_cast<float>(1.0 - std::exp(dac8580[fc] * ratio8580));
+        }
+        float prev = 0.0f;
+        for (int fc = 0; fc < 2048; fc++) {
+            fcCutoffTable6581[fc] = std::max(fcCutoffTable6581[fc], prev);
+            prev = fcCutoffTable6581[fc];
+        }
+        const double dt = 1.0 / sampleRate;
+        w0lp = static_cast<float>(dt / (dt + 10e3 * 1000e-12));
+        w0hp = static_cast<float>(dt / (dt + 10e3 * 10e-6));
+    }
 
     // Note: method and highestAccurateFrequency parameters are ignored
     // reSIDuEngine always uses sample-accurate processing
