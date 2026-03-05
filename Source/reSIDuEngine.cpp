@@ -81,51 +81,53 @@ static void buildKinkedDacTable(double* out, int bits,
                                 double rRatio, bool hasTerm, double leakage)
 {
     constexpr double R_INFINITY = 1e6;
-    const double _2R = rRatio;       // normalized R = 1.0
-    std::vector<double> dac(bits);
-    double Vsum = 0.0;
+    const double twoR = rRatio;          // normalized R = 1.0; twoR = 2R arm of R-2R ladder
+    std::vector<double> bitWeights(bits);
+    double voltageSum = 0.0;
 
-    for (int set_bit = 0; set_bit < bits; set_bit++)
+    for (int activeBit = 0; activeBit < bits; activeBit++)
     {
-        double Vn = 1.0;
-        double R  = 1.0;
-        double Rn = hasTerm ? _2R : R_INFINITY;
+        double nodeVoltage  = 1.0;
+        double unitR        = 1.0;
+        double nodeResistance = hasTerm ? twoR : R_INFINITY;
 
         // Build "tail" resistance by repeated parallel substitution
-        for (int bit = 0; bit < set_bit; bit++)
-            Rn = (Rn == R_INFINITY) ? R + _2R : R + (_2R * Rn) / (_2R + Rn);
+        for (int bit = 0; bit < activeBit; bit++)
+            nodeResistance = (nodeResistance == R_INFINITY)
+                ? unitR + twoR
+                : unitR + (twoR * nodeResistance) / (twoR + nodeResistance);
 
         // Source transformation for bit voltage
-        if (Rn == R_INFINITY) {
-            Rn = _2R;
+        if (nodeResistance == R_INFINITY) {
+            nodeResistance = twoR;
         } else {
-            Rn = (_2R * Rn) / (_2R + Rn);
-            Vn = Vn * Rn / _2R;
+            nodeResistance = (twoR * nodeResistance) / (twoR + nodeResistance);
+            nodeVoltage = nodeVoltage * nodeResistance / twoR;
         }
 
         // Propagate to output
-        for (int bit = set_bit + 1; bit < bits; bit++) {
-            Rn += R;
-            const double I = Vn / Rn;
-            Rn = (_2R * Rn) / (_2R + Rn);
-            Vn = Rn * I;
+        for (int bit = activeBit + 1; bit < bits; bit++) {
+            nodeResistance += unitR;
+            const double nodeCurrent = nodeVoltage / nodeResistance;
+            nodeResistance = (twoR * nodeResistance) / (twoR + nodeResistance);
+            nodeVoltage = nodeResistance * nodeCurrent;
         }
 
-        dac[set_bit] = Vn;
-        Vsum += Vn;
+        bitWeights[activeBit] = nodeVoltage;
+        voltageSum += nodeVoltage;
     }
 
     // Normalize and accumulate into output table for each input value
     for (int i = 0; i < bits; i++)
-        dac[i] /= Vsum;
+        bitWeights[i] /= voltageSum;
 
     const int tableSize = 1 << bits;
     for (int input = 0; input < tableSize; input++)
     {
-        double val = 0.0;
+        double dacOutput = 0.0;
         for (int i = 0; i < bits; i++)
-            val += ((input >> i) & 1) ? dac[i] : dac[i] * leakage;
-        out[input] = val;
+            dacOutput += ((input >> i) & 1) ? bitWeights[i] : bitWeights[i] * leakage;
+        out[input] = dacOutput;
     }
 }
 
@@ -225,8 +227,8 @@ SID::SID(double sampleRate, SIDModel model)
     //   HP: R=10 kΩ, C=10 µF  → ~1.6 Hz   (removes DC offset from filter integrators)
     {
         const double dt = 1.0 / sampleRate;
-        w0lp = static_cast<float>(dt / (dt + 10e3 * 1000e-12));
-        w0hp = static_cast<float>(dt / (dt + 10e3 * 10e-6));
+        extLPCoeff = static_cast<float>(dt / (dt + 10e3 * 1000e-12));
+        extHPCoeff = static_cast<float>(dt / (dt + 10e3 * 10e-6));
     }
 
     // Build oscillator waveform DAC tables (12-bit, 4096 entries per chip model).
@@ -481,7 +483,7 @@ void SID::write(int addr, unsigned char value)
     // Accept addresses in multiple forms for compatibility:
     // - Full address (0xD400-0xD41F) - legacy reSIDuEngine
     // - Register offset (0-31) - reSIDfp API
-    int reg = addr & 0x1F;
+    int regOffset = addr & 0x1F;
 
     // All writes drive the data bus; track value and refresh capacitive TTL.
     busValue    = value;
@@ -491,9 +493,9 @@ void SID::write(int addr, unsigned char value)
     // Control registers: offset 4 (voice 0), 11 (voice 1), 18 (voice 2).
     // This ensures gate-off/gate-on sequences within a single sample
     // period are not lost (the ADSR state machine sees both transitions).
-    if (reg == 4 || reg == 11 || reg == 18)
+    if (regOffset == 4 || regOffset == 11 || regOffset == 18)
     {
-        int voiceIndex = (reg - 4) / 7;
+        int voiceIndex = (regOffset - 4) / 7;
         uint8_t previousGate = adsrState[voiceIndex] & GATE_BITMASK;
         uint8_t newGate = value & GATE_BITMASK;
 
@@ -512,7 +514,7 @@ void SID::write(int addr, unsigned char value)
         }
     }
 
-    SIDRegister[reg] = value;
+    SIDRegister[regOffset] = value;
 }
 
 /**
@@ -529,13 +531,13 @@ void SID::write(int addr, unsigned char value)
  */
 unsigned char SID::read(int addr)
 {
-    const int reg = addr & 0x1F;
-    switch (reg)
+    const int regOffset = addr & 0x1F;
+    switch (regOffset)
     {
     case 0x1B:  // OSC3: voice 3 oscillator output (read-only)
     case 0x1C:  // ENV3: voice 3 envelope output  (read-only)
         // Reading a valid register drives the bus with its value and refreshes TTL.
-        busValue    = SIDRegister[reg];
+        busValue    = SIDRegister[regOffset];
         busValueTtl = (sidModel == MOS6581) ? BUS_TTL_6581 : BUS_TTL_8580;
         return busValue;
     default:
@@ -578,32 +580,32 @@ void SID::createCombinedWF(std::array<uint16_t, 4096>& waveformArray,
                              double bitmul, double bitstrength, double threshold)
 {
     // Iterate through all possible 12-bit input combinations
-    for (int i = 0; i < 4096; i++)
+    for (int inputPhase = 0; inputPhase < 4096; inputPhase++)
     {
-        waveformArray[i] = 0;
+        waveformArray[inputPhase] = 0;
 
         // For each output bit position
-        for (int j = 0; j < 12; j++)
+        for (int outputBit = 0; outputBit < 12; outputBit++)
         {
-            double bitlevel = 0;
+            double bitInfluence = 0;
 
             // Calculate influence from all input bits
-            for (int k = 0; k < 12; k++)
+            for (int inputBit = 0; inputBit < 12; inputBit++)
             {
-                // Influence decreases with distance between bits j and k
-                // Also depends on whether input bit k is set (centered at 0.5)
-                bitlevel += (bitmul / std::pow(bitstrength, std::abs(k - j))) *
-                           (((i >> k) & 1) - 0.5);
+                // Influence decreases with distance between outputBit and inputBit
+                // Also depends on whether input bit inputBit is set (centered at 0.5)
+                bitInfluence += (bitmul / std::pow(bitstrength, std::abs(inputBit - outputBit))) *
+                           (((inputPhase >> inputBit) & 1) - 0.5);
             }
 
-            // If accumulated influence exceeds threshold, set output bit j
-            if (bitlevel >= threshold)
-                waveformArray[i] += static_cast<uint16_t>(std::pow(2, j));
+            // If accumulated influence exceeds threshold, set output bit outputBit
+            if (bitInfluence >= threshold)
+                waveformArray[inputPhase] += static_cast<uint16_t>(std::pow(2, outputBit));
         }
 
         // Scale up by 12 to match the range of normal waveforms
         // This compensates for the bit-fighting reducing overall amplitude
-        waveformArray[i] *= 12;
+        waveformArray[inputPhase] *= 12;
     }
 }
 
@@ -634,12 +636,12 @@ uint16_t SID::combinedWF(int voiceIndex, const std::array<uint16_t, 4096>& wavef
 
     // Simple averaging with previous sample to smooth waveform transitions
     // This helps reduce discontinuities when the waveform changes rapidly
-    uint16_t combiwf = (waveformArray[index] + previousWaveData[voiceIndex]) / 2;
+    uint16_t avgWF = (waveformArray[index] + previousWaveData[voiceIndex]) / 2;
 
     // Store current value for next sample's interpolation
     previousWaveData[voiceIndex] = waveformArray[index];
 
-    return combiwf;
+    return avgWF;
 }
 
 /**
@@ -662,54 +664,53 @@ uint16_t SID::combinedWF(int voiceIndex, const std::array<uint16_t, 4096>& wavef
 uint16_t SID::getMeasuredCombinedWF(int voiceIndex, int index, uint8_t waveformCtrl)
 {
     // Select the appropriate lookup table based on waveform combination
-    const std::array<uint16_t, 4096>* wfArray = nullptr;
+    const std::array<uint16_t, 4096>* waveformTable = nullptr;
     
     switch (waveformCtrl & 0xF0) {
         case (TRI_BITMASK | SAW_BITMASK):
-            wfArray = &triSaw8580;
+            waveformTable = &triSaw8580;
             break;
         case (PULSE_BITMASK | TRI_BITMASK):
-            wfArray = &pulseTriangle8580;
+            waveformTable = &pulseTriangle8580;
             break;
         case (PULSE_BITMASK | SAW_BITMASK):
-            wfArray = &pulseSaw8580;
+            waveformTable = &pulseSaw8580;
             break;
         case (PULSE_BITMASK | TRI_BITMASK | SAW_BITMASK):
-            wfArray = &pulseTriSaw8580;
+            waveformTable = &pulseTriSaw8580;
             break;
         default:
             // Should never happen - return 0 for safety
             return 0;
     }
-    
-    // Get pitch for frequency-dependent filtering
-    // Extract frequency from voice registers (assuming 16-bit frequency value)
+
+    // Get frequency-dependent blend coefficient from voice registers
     const uint8_t* voiceRegister = &SIDRegister[voiceIndex * 7];
     uint16_t freq = voiceRegister[0] | (voiceRegister[1] << 8);
-    uint8_t pitch = (freq >> 8) ? (freq >> 8) : 1; // Avoid division by zero
-    
-    // Apply frequency-dependent filtering using 0x7777 + 0x8888/pitch coefficients
-    // This models how the analog circuitry's response varies with frequency
-    uint16_t filterCoeff = 0x7777 + (0x8888 / pitch);
-    
+    uint8_t freqHighByte = (freq >> 8) ? (freq >> 8) : 1; // Avoid division by zero
+
+    // Blend coefficient: higher frequency → more weight on current table entry
+    // Models how the analog circuitry's capacitive response varies with frequency
+    uint16_t blendCoeff = 0x7777 + (0x8888 / freqHighByte);
+
     // Get table value
-    uint16_t tableValue = (*wfArray)[index >> 4]; // Scale 12-bit to 8-bit table index
-    
-    // Apply frequency-dependent filtering with previous value feedback
-    // This models the capacitive coupling and frequency response of the analog circuit
-    uint32_t filteredValue = (tableValue * filterCoeff + 
-                             previousWaveData[voiceIndex] * (0xFFFF - filterCoeff)) >> 16;
-    
+    uint16_t tableEntry = (*waveformTable)[index >> 4]; // Scale 12-bit to 8-bit table index
+
+    // Blend current table entry with previous sample value
+    // Models the capacitive coupling and frequency response of the analog circuit
+    uint32_t blendedWF = (tableEntry * blendCoeff +
+                          previousWaveData[voiceIndex] * (0xFFFF - blendCoeff)) >> 16;
+
     // Store current value for next sample's feedback
-    previousWaveData[voiceIndex] = tableValue;
-    
+    previousWaveData[voiceIndex] = tableEntry;
+
     // Apply 6581-specific behavior (reduced bit depth for some combinations)
     if (sidModel == MOS6581 && (waveformCtrl & PULSE_BITMASK)) {
         // On 6581, pulse combinations often have reduced bit depth
-        filteredValue &= 0x7FFF; // Mask off MSB (11-bit instead of 12-bit)
+        blendedWF &= 0x7FFF; // Mask off MSB (11-bit instead of 12-bit)
     }
-    
-    return static_cast<uint16_t>(filteredValue) << 8; // Scale back to 16-bit range
+
+    return static_cast<uint16_t>(blendedWF) << 8; // Scale back to 16-bit range
 }
 
 /**
@@ -759,14 +760,14 @@ float SID::processSID()
         const uint8_t* voiceRegister = &SIDRegister[voiceIndex * 7];
 
         // Read control register: contains waveform, gate, sync, ring, test bits
-        uint8_t ctrl = voiceRegister[4];
-        uint8_t waveformCTRL = ctrl & 0xF0;  // Waveform bits (upper nibble)
-        uint8_t test = ctrl & TEST_BITMASK;  // Test bit (halts oscillator)
+        uint8_t controlReg = voiceRegister[4];
+        uint8_t waveformCTRL = controlReg & 0xF0;  // Waveform bits (upper nibble)
+        uint8_t test = controlReg & TEST_BITMASK;  // Test bit (halts oscillator)
 
         // Read sustain/release register
-        uint8_t SR = voiceRegister[6];
+        uint8_t sustainReleaseReg = voiceRegister[6];
 
-        int tmp = 0;  // Multipurpose temporary variable
+        bool triggerImmediateADSR = false;  // Set when SR->gate write order workaround fires
 
         // Check previous gate state to detect gate transitions
         uint8_t previousGate = adsrState[voiceIndex] & GATE_BITMASK;
@@ -780,7 +781,7 @@ float SID::processSID()
         //         Sustain (holding at level), Release (ramping to zero)
 
         // Detect gate bit transitions (note on/off events)
-        if (previousGate != (ctrl & GATE_BITMASK))
+        if (previousGate != (controlReg & GATE_BITMASK))
         {
             if (previousGate)
             {
@@ -797,13 +798,13 @@ float SID::processSID()
                 // Workaround for SR->GATE write order issue
                 // If sustain/release was just written with a higher value, trigger
                 // an immediate envelope update for crisp attack starts
-                if ((SR & 0xF) > (previousSR[voiceIndex] & 0xF))
-                    tmp = 1;
+                if ((sustainReleaseReg & 0xF) > (previousSR[voiceIndex] & 0xF))
+                    triggerImmediateADSR = true;
             }
         }
 
         // Remember current SR value for next sample's comparison
-        previousSR[voiceIndex] = SR;
+        previousSR[voiceIndex] = sustainReleaseReg;
 
         // Advance the rate counter by the number of CPU cycles elapsed this sample.
         // The counter is in CPU-cycle units; adsrPeriods[] holds the hardware-accurate
@@ -832,7 +833,7 @@ float SID::processSID()
         }
         else
         {
-            rateIndex = SR & 0xF;                     // Release rate (lower nibble of SR)
+            rateIndex = sustainReleaseReg & 0xF;      // Release rate (lower nibble of SR)
             period    = adsrPeriods[rateIndex];
         }
         (void)rateIndex;  // only used for period lookup above
@@ -840,7 +841,7 @@ float SID::processSID()
         // Fire the envelope step once for each full period that has elapsed.
         // Using a while loop (rather than a single if) handles fast rates where the
         // LFSR period is shorter than one audio sample (e.g. rate 0 fires ~3×/sample).
-        while (rateCounter[voiceIndex] >= period && tmp == 0)
+        while (rateCounter[voiceIndex] >= period && !triggerImmediateADSR)
         {
             rateCounter[voiceIndex] -= period;
 
@@ -864,7 +865,7 @@ float SID::processSID()
                         }
                     }
                     else if (!(adsrState[voiceIndex] & DECAYSUSTAIN_BITMASK) ||
-                             envelopeCounter[voiceIndex] > (SR >> 4) + (SR & 0xF0))
+                             envelopeCounter[voiceIndex] > (sustainReleaseReg >> 4) + (sustainReleaseReg & 0xF0))
                     {
                         // Decay/Release: decrement; hold at zero when floor is reached.
                         --envelopeCounter[voiceIndex];
@@ -900,7 +901,7 @@ float SID::processSID()
         // Update phase accumulator with sync and test handling
         // For sync: voice 0 syncs to voice 2, voice 1 to voice 0, voice 2 to voice 1
         int syncSource = (voiceIndex + 2) % SID_CHANNELS;
-        if (test || ((ctrl & SYNC_BITMASK) && sourceMSBrise[syncSource]))
+        if (test || ((controlReg & SYNC_BITMASK) && sourceMSBrise[syncSource]))
         {
             // Test bit or hard sync: reset phase to zero
             // Hard sync resets this oscillator when the sync source oscillator's
@@ -942,7 +943,7 @@ float SID::processSID()
             // The output is 8 specific bits from the LFSR, creating a pseudo-random
             // sequence that repeats every 8,388,607 samples (for maximum-length LFSR)
 
-            tmp = noiseLFSR[voiceIndex];
+            uint32_t lfsrState = noiseLFSR[voiceIndex];
 
             // Clock the LFSR when bit 19 transitions or when frequency is very high
             // Bit 19 (0x100000) serves as the clock input to the noise generator
@@ -952,9 +953,9 @@ float SID::processSID()
             {
                 // LFSR feedback polynomial: bits 22 and 17
                 // XOR these bits and shift them in at the LSB
-                uint32_t step = (tmp & 0x400000) ^ ((tmp & 0x20000) << 5);
-                tmp = ((tmp << 1) + (step > 0 || test)) & 0x7FFFFF;
-                noiseLFSR[voiceIndex] = tmp;
+                uint32_t step = (lfsrState & 0x400000) ^ ((lfsrState & 0x20000) << 5);
+                lfsrState = ((lfsrState << 1) + (step > 0 || test)) & 0x7FFFFF;
+                noiseLFSR[voiceIndex] = lfsrState;
             }
 
             // Extract noise output from 8 specific LFSR bits
@@ -969,10 +970,10 @@ float SID::processSID()
             {
                 // Pure noise: extract and recombine 8 bits from the LFSR
                 // Bit pattern: 20,18,14,11,9,5,2,0 shifted to form 8-bit value
-                waveformOutput = ((tmp & 0x100000) >> 5) + ((tmp & 0x40000) >> 4) +
-                       ((tmp & 0x4000) >> 1) + ((tmp & 0x800) << 1) +
-                       ((tmp & 0x200) << 2) + ((tmp & 0x20) << 5) +
-                       ((tmp & 0x04) << 7) + ((tmp & 0x01) << 8);
+                waveformOutput = ((lfsrState & 0x100000) >> 5) + ((lfsrState & 0x40000) >> 4) +
+                       ((lfsrState & 0x4000) >> 1) + ((lfsrState & 0x800) << 1) +
+                       ((lfsrState & 0x200) << 2) + ((lfsrState & 0x20) << 5) +
+                       ((lfsrState & 0x04) << 7) + ((lfsrState & 0x01) << 8);
             }
         }
         else if (waveformCTRL & PULSE_BITMASK)
@@ -988,16 +989,16 @@ float SID::processSID()
 
             // Calculate step size for band-limiting (anti-aliasing)
             // This is used to smooth transitions at pulse edges
-            tmp = static_cast<int>(accumulatorAdd) >> 9;
+            int bandLimitStep = static_cast<int>(accumulatorAdd) >> 9;
 
             // Limit pulse width to valid range
-            // PW must be between tmp and (0xFFFF - tmp) to avoid artifacts
-            if (0 < pulseWidth && pulseWidth < tmp) pulseWidth = tmp;
-            tmp ^= 0xFFFF;
-            if (pulseWidth > tmp) pulseWidth = tmp;
+            // PW must be between bandLimitStep and (0xFFFF - bandLimitStep) to avoid artifacts
+            if (0 < pulseWidth && pulseWidth < bandLimitStep) pulseWidth = bandLimitStep;
+            bandLimitStep ^= 0xFFFF;
+            if (pulseWidth > bandLimitStep) pulseWidth = bandLimitStep;
 
             // Get current phase (16-bit, upper bits of 24-bit accumulator)
-            tmp = phaseAccumulator[voiceIndex] >> 8;
+            int phase16 = phaseAccumulator[voiceIndex] >> 8;
 
             if (waveformCTRL == PULSE_BITMASK)
             {
@@ -1017,7 +1018,7 @@ float SID::processSID()
                     // Test bit set: output maximum (all bits high)
                     waveformOutput = 0xFFFF;
                 }
-                else if (tmp < pulseWidth)
+                else if (phase16 < pulseWidth)
                 {
                     // Rising edge of pulse (phase crossing pulse width threshold)
                     // Apply band-limiting to smooth the transition from low to high
@@ -1025,7 +1026,7 @@ float SID::processSID()
                     if (lim > 0xFFFF) lim = 0xFFFF;
 
                     // Linear interpolation across the transition
-                    double waveformOutput_d = lim - (pulseWidth - tmp) * step;
+                    double waveformOutput_d = lim - (pulseWidth - phase16) * step;
                     if (waveformOutput_d < 0) waveformOutput_d = 0;
 
                     waveformOutput = static_cast<uint16_t>(waveformOutput_d);
@@ -1038,7 +1039,7 @@ float SID::processSID()
                     if (lim > 0xFFFF) lim = 0xFFFF;
 
                     // Linear interpolation across the transition
-                    double waveformOutput_d = (0xFFFF - tmp) * step - lim;
+                    double waveformOutput_d = (0xFFFF - phase16) * step - lim;
                     if (waveformOutput_d >= 0) waveformOutput_d = 0xFFFF;
 
                     waveformOutput = static_cast<uint16_t>(waveformOutput_d) & 0xFFFF;
@@ -1053,14 +1054,14 @@ float SID::processSID()
                 // Use lookup tables for the complex analog interactions
 
                 // Basic pulse: 0xFFFF if phase >= pulseWidth, else 0
-                waveformOutput = (tmp >= pulseWidth || test) ? 0xFFFF : 0;
+                waveformOutput = (phase16 >= pulseWidth || test) ? 0xFFFF : 0;
 
                 if (waveformCTRL & TRI_BITMASK)
                 {
                     if (waveformCTRL & SAW_BITMASK)
                     {
                         // Pulse + Triangle + Sawtooth: all three waveforms
-                        waveformOutput = waveformOutput ? reSIDuEngine::SID::combinedWF(voiceIndex, pulseTriSaw8580, tmp >> 4, true) : 0;
+                        waveformOutput = waveformOutput ? reSIDuEngine::SID::combinedWF(voiceIndex, pulseTriSaw8580, phase16 >> 4, true) : 0;
                     }
                     else
                     {
@@ -1068,20 +1069,20 @@ float SID::processSID()
                         // XOR phase with previous voice's MSB if ring mod is enabled
                         // For ring mod: voice 0 modulated by voice 2, voice 1 by voice 0, voice 2 by voice 1
                         int ringSource = (voiceIndex + 2) % SID_CHANNELS;
-                        tmp = phaseAccumulator[voiceIndex] ^
-                              (ctrl & RING_BITMASK ? sourceMSB[ringSource] : 0);
+                        int ringModPhase = phaseAccumulator[voiceIndex] ^
+                              (controlReg & RING_BITMASK ? sourceMSB[ringSource] : 0);
 
                         // Triangle waveform: fold phase at midpoint to create triangle shape
                         // Then use pulse+triangle combined waveform table
                         waveformOutput = waveformOutput ? combinedWF(voiceIndex, pulseTriangle8580,
-                                       (tmp ^ (tmp & 0x800000 ? 0xFFFFFF : 0)) >> 11, false) : 0;
+                                       (ringModPhase ^ (ringModPhase & 0x800000 ? 0xFFFFFF : 0)) >> 11, false) : 0;
                     }
                 }
                 else if (waveformCTRL & SAW_BITMASK)
                 {
                     // Pulse + Sawtooth
-waveformOutput = waveformOutput ? reSIDuEngine::SID::combinedWF(voiceIndex, pulseSaw8580,
-                            tmp >> 4, true) : 0;
+                    waveformOutput = waveformOutput ? reSIDuEngine::SID::combinedWF(voiceIndex, pulseSaw8580,
+                                phase16 >> 4, true) : 0;
                 }
             }
         }
@@ -1133,12 +1134,12 @@ waveformOutput = waveformOutput ? reSIDuEngine::SID::combinedWF(voiceIndex, puls
             int ringSource = (voiceIndex + 2) % SID_CHANNELS;
 
             // Apply ring modulation if enabled
-            tmp = phaseAccumulator[voiceIndex] ^
-                  (ctrl & RING_BITMASK ? sourceMSB[ringSource] : 0);
+            int ringModPhase = phaseAccumulator[voiceIndex] ^
+                  (controlReg & RING_BITMASK ? sourceMSB[ringSource] : 0);
 
             // Create triangle by folding: if MSB is set, invert all bits
             // Then shift right by 7 to get 16-bit output (17-bit intermediate)
-            waveformOutput = (tmp ^ (tmp & 0x800000 ? 0xFFFFFF : 0)) >> 7;
+            waveformOutput = (ringModPhase ^ (ringModPhase & 0x800000 ? 0xFFFFFF : 0)) >> 7;
         }
 
         // -------------------------------------------------------------------
@@ -1294,23 +1295,23 @@ waveformOutput = waveformOutput ? reSIDuEngine::SID::combinedWF(voiceIndex, puls
 
         // Highpass output: input - (resonance * BP + LP)
         // This is the input signal with low and mid frequencies removed
-        double tmp = filterInput + previousBandpass * resonance + previousLowpass;
+        double hpOut = filterInput + previousBandpass * resonance + previousLowpass;
         if (SIDRegister[0x18] & HIGHPASS_BITMASK)
-            output -= tmp * resonanceCompensation;  // Mix highpass into output if enabled
+            output -= hpOut * resonanceCompensation;  // Mix highpass into output if enabled
 
         // Update bandpass integrator: BP = BP - (HP * cutoff)
         // Bandpass removes highs and lows, leaving only mid frequencies
-        tmp = previousBandpass - tmp * cutoff;
-        previousBandpass = tmp;
+        double bpOut = previousBandpass - hpOut * cutoff;
+        previousBandpass = bpOut;
         if (SIDRegister[0x18] & BANDPASS_BITMASK)
-            output -= tmp * resonanceCompensation;  // Mix bandpass into output if enabled
+            output -= bpOut * resonanceCompensation;  // Mix bandpass into output if enabled
 
         // Update lowpass integrator: LP = LP + (BP * cutoff)
         // Lowpass removes high frequencies, leaving only lows
-        tmp = previousLowpass + tmp * cutoff;
-        previousLowpass = tmp;
+        double lpOut = previousLowpass + bpOut * cutoff;
+        previousLowpass = lpOut;
         if (SIDRegister[0x18] & LOWPASS_BITMASK)
-            output += tmp * resonanceCompensation;  // Mix lowpass into output if enabled
+            output += lpOut * resonanceCompensation;  // Mix lowpass into output if enabled
     }
     else
     {
@@ -1335,8 +1336,8 @@ waveformOutput = waveformOutput ? reSIDuEngine::SID::combinedWF(voiceIndex, puls
     float result = static_cast<float>((output / 0x10000) * (SIDRegister[0x18] & 0xF) / 15.0f);
 
     // External RC filter: LP at ~16 kHz (near-transparent), HP at ~1.6 Hz (DC removal)
-    externalLowpass  += w0lp * (result      - externalLowpass);
-    externalHighpass += w0hp * (externalLowpass - externalHighpass);
+    externalLowpass  += extLPCoeff * (result      - externalLowpass);
+    externalHighpass += extHPCoeff * (externalLowpass - externalHighpass);
     result = externalLowpass - externalHighpass;
 
     // Soft clipping: tanh-based compression above ±1.0 to prevent harsh digital peaks
@@ -1461,8 +1462,8 @@ void SID::setSamplingParameters(double clockFrequency, int /*method*/,
             prev = fcCutoffTable6581[fc];
         }
         const double dt = 1.0 / sampleRate;
-        w0lp = static_cast<float>(dt / (dt + 10e3 * 1000e-12));
-        w0hp = static_cast<float>(dt / (dt + 10e3 * 10e-6));
+        extLPCoeff = static_cast<float>(dt / (dt + 10e3 * 1000e-12));
+        extHPCoeff = static_cast<float>(dt / (dt + 10e3 * 10e-6));
     }
 
     // Note: method and highestAccurateFrequency parameters are ignored

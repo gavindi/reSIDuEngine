@@ -2,6 +2,11 @@
 
 All notable changes to reSIDuEngine will be documented in this file.
 
+## [1.8.0] - 2026-03-05
+
+### Changed
+- Renamed cryptic and reused variable names throughout `reSIDuEngine.cpp` and `reSIDuEngine.h` for clarity: `tmp` in `processSID()` split into purpose-specific names (`triggerImmediateADSR`, `lfsrState`, `bandLimitStep`, `phase16`, `ringModPhase`, `hpOut`, `bpOut`, `lpOut`); math-notation names in `buildKinkedDacTable()` replaced (`_2R`→`twoR`, `Vn`→`nodeVoltage`, `Rn`→`nodeResistance`, `I`→`nodeCurrent`, `Vsum`→`voltageSum`); `combiwf`→`avgWF`, `wfArray`→`waveformTable`, `bitlevel`→`bitInfluence`, `SR`→`sustainReleaseReg`, `ctrl`→`controlReg`, `w0lp`/`w0hp`→`extLPCoeff`/`extHPCoeff`
+
 ## [1.7.0] - 2026-03-05
 
 ### Changed

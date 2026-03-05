@@ -674,8 +674,8 @@ uint16_t combinedWF(int voiceIndex, const std::array<uint16_t, 4096>& waveformAr
     std::array<float, 256>  envDAC8580; ///< Envelope DAC (8580: kinked R-2R)
     float externalLowpass;   ///< External RC low-pass state  (16 kHz)
     float externalHighpass;  ///< External RC high-pass state (1.6 Hz)
-    float w0lp;              ///< External LP coefficient (computed at init)
-    float w0hp;              ///< External HP coefficient (computed at init)
+    float extLPCoeff;        ///< External RC low-pass coefficient (computed at init)
+    float extHPCoeff;        ///< External RC high-pass coefficient (computed at init)
 
     // ========================================================================
     // Member Variables - Combined Waveform Lookup Tables
