@@ -58,7 +58,7 @@ Each voice has an independent envelope with:
 ### Clock and Timing
 ```cpp
 double sampleRate;          // Audio output rate (e.g., 44100 Hz)
-double cpuClock;            // C64 CPU clock (985248 Hz for PAL)
+double cpuClock;            // C64 CPU clock (985248 Hz PAL, 1022727 Hz NTSC)
 double frameRate;           // Video frame rate (50 Hz for PAL, 60 for NTSC)
 double clkRatio;            // CPU cycles per sample (cpuClock / sampleRate)
 double frameSamplePeriod;   // Samples per frame (sampleRate / frameRate)
@@ -428,4 +428,8 @@ Typical usage is single-threaded within an audio callback.
 - `getMeasuredCombinedWF(voiceIndex, index, waveformCtrl)` - Advanced frequency-dependent filtering with feedback
 
 ### Constants
+- `C64_PAL_CPUCLK = 985248.0` - PAL C64 CPU clock frequency (Hz)
+- `PAL_FRAMERATE = 50.0` - PAL video frame rate (Hz)
+- `C64_NTSC_CPUCLK = 1022727.0` - NTSC C64 CPU clock frequency (Hz)
+- `NTSC_FRAMERATE = 60.0` - NTSC video frame rate (Hz, rounded from 59.826)
 - `EXTIN_BITMASK = 0x08` - External input filter routing bit (register 0xD417)

@@ -43,7 +43,10 @@ constexpr double C64_PAL_CPUCLK = 985248.0;  // Hz
  * PAL systems refresh at 50 frames per second (compared to NTSC's ~60 fps).
  * This affects timing for music playback that relies on frame-synchronized updates.
  */
-constexpr double PAL_FRAMERATE = 50.0;
+constexpr double PAL_FRAMERATE  = 50.0;
+
+constexpr double C64_NTSC_CPUCLK = 1022727.0;  // Hz
+constexpr double NTSC_FRAMERATE  = 60.0;         // Hz (59.826 rounded)
 
 // ============================================================================
 // Control Register Bit Masks

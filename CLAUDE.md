@@ -42,6 +42,7 @@ cmake --build .
 - `build/examples/sid_player` - SID file player with SDL2 (if SDL2 found)
 - `build/examples/sid_player_portaudio` - SID file player with PortAudio (if PortAudio found)
 - `build/examples/sid_player_miniaudio` - SID file player with miniaudio (if miniaudio.h found)
+- `build/examples/sidplayer2` - Enhanced single-SID player with miniaudio, IRQ injection, NMI digi, and PAL/NTSC detection (if miniaudio.h found)
 
 ### Running Examples
 
@@ -88,7 +89,7 @@ The `SID` class contains:
 
 4. **Multi-Mode Filter**: Bi-quadratic state-variable filter supporting lowpass, bandpass, and highpass modes with per-voice routing and resonance control. Separate implementations for 6581 and 8580 filter characteristics.
 
-5. **Clock and Sample Rate**: The SID runs at PAL clock frequency (985248 Hz) and generates output at the configured sample rate (typically 44100 Hz).
+5. **Clock and Sample Rate**: The SID runs at PAL (985248 Hz) or NTSC (1022727 Hz) CPU clock frequency and generates output at the configured sample rate (typically 44100 Hz).
 
 ### Voice Interconnections
 
@@ -127,8 +128,8 @@ freq_register = (note_frequency_Hz * 16777216) / clock_frequency_Hz
 ```
 
 Where:
-- PAL clock: 985248 Hz (C64_PAL_CPUCLK constant)
-- NTSC clock: 1022727 Hz
+- PAL clock:  985248 Hz (`C64_PAL_CPUCLK` constant)
+- NTSC clock: 1022727 Hz (`C64_NTSC_CPUCLK` constant)
 - 16777216 = 2^24 (phase accumulator size)
 
 ## Key Implementation Details
@@ -162,6 +163,8 @@ Important constants defined in the header:
 - `SID_CHANNELS = 3`
 - `C64_PAL_CPUCLK = 985248.0`
 - `PAL_FRAMERATE = 50.0`
+- `C64_NTSC_CPUCLK = 1022727.0`
+- `NTSC_FRAMERATE = 60.0`
 
 Control register bits:
 - `GATE_BITMASK = 0x01` (start/stop envelope)
@@ -191,20 +194,28 @@ Filter routing bits (0xD417):
 
 ### SID Player Examples
 
-Three complete SID file player implementations demonstrating integration with CPU emulation and real-time audio output:
+Four complete SID file player implementations demonstrating integration with CPU emulation and real-time audio output:
 
 - **sid_player.cpp** (SDL2) - Uses SDL2 for cross-platform audio output
 - **sid_player_portaudio.cpp** (PortAudio) - Uses PortAudio for professional-grade cross-platform audio
 - **sid_player_miniaudio.cpp** (miniaudio) - Uses single-header miniaudio library (easiest to integrate)
+- **sidplayer2.cpp** (miniaudio) - Enhanced single-SID player; see below
 
-All three players:
+The first three players:
 - Load and parse .sid files (Commodore 64 music format)
 - Emulate 6502 CPU to run the music player code
 - Support up to 3 SID chips for multi-SID tunes
 - Support both MOS6581 and MOS8580 chip models
 - Handle subtune selection
 
-**Key implementation details:**
+**sidplayer2** is a more hardware-accurate single-SID player (rejects multi-SID files):
+- PAL/NTSC C64 model auto-detected from SID header; CPU clock and frame rate set accordingly
+- Full hardware IRQ simulation: 3-byte return frame pushed onto stack, I flag set before calling play routine
+- NMI digi support: CIA2 Timer A driven sample playback captured via `nmiDigiD418`
+- Secondary IRQ chaining: detects and fires mid-frame handler changes (e.g. Arkanoid raster trick)
+- MOS8580 digiboost via `input(-32768)` for external-input amplitude modulation
+
+**Key implementation details (all players):**
 - Register writes from CPU are forwarded to reSIDuEngine via `write()`
 - Audio samples generated via `clock()` once per output sample
 - Output scaled by 0.25 to prevent clipping

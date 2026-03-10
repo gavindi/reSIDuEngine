@@ -2,6 +2,16 @@
 
 All notable changes to reSIDuEngine will be documented in this file.
 
+## [1.9.0] - 2026-03-10
+
+### Changed
+- `sidplayer2`: PAL/NTSC C64 model now detected from SID file header byte `0x77` bits 2–3 (`0x08` = NTSC, otherwise PAL); CPU clock (`985248 Hz` PAL / `1022727 Hz` NTSC) and frame rate (`50 Hz` / `60 Hz`) are set accordingly, fixing NTSC tunes that previously played sharp by ~3.8%
+- Added `C64_NTSC_CPUCLK = 1022727.0` and `NTSC_FRAMERATE = 60.0` constants to `reSIDuEngine.h`
+- `sidplayer2`: Frame trigger now performs full hardware IRQ simulation — a 3-byte return frame (PCL/PCH of `0xEA31`, status with I-flag set) is pushed onto the stack before jumping to the play address, and `ST` has the interrupt-disable flag set, matching the CPU state a real C64 interrupt handler receives; previously the play routine was called as a bare subroutine with an empty stack
+- `sidplayer2`: IRQ return detection (`0xEA31`/`0xEA81`) no longer requires ROM to be banked in; the ROM-bank guard was removed since the return address is now always our injected sentinel
+- `sidplayer2`: Secondary IRQ chaining (e.g. Arkanoid raster trick) uses the same IRQ injection as the primary frame trigger
+- `sidplayer2`: Removed leftover debug `printf` calls (`DBG init`, D418 write log, secondary IRQ fire log) and their associated static counters
+
 ## [1.8.0] - 2026-03-05
 
 ### Changed

@@ -118,7 +118,7 @@ reSIDuEngine::SID sid(44100, reSIDuEngine::MOS8580);
 
 // Set voice 1 to sawtooth at 440 Hz (A4)
 // Calculate frequency register: (note_freq * 16777216) / clock_freq
-uint16_t freq = (440.0 * 16777216.0) / 985248.0;
+uint16_t freq = (440.0 * 16777216.0) / reSIDuEngine::C64_PAL_CPUCLK;
 
 // Write frequency
 sid.write(0xD400, freq & 0xFF);        // FREQ_LO
@@ -226,12 +226,12 @@ sid.setSamplingParameters(985248, reSIDfp::RESAMPLE_INTERPOLATE, 44100);
 
 // Equivalent reSIDuEngine code (constructor approach)
 reSIDuEngine::SID sid(44100, reSIDuEngine::MOS8580);
-sid.setClock(985248);
+sid.setClock(reSIDuEngine::C64_PAL_CPUCLK);
 
 // OR using reSIDfp-compatible API
 reSIDuEngine::SID sid(44100);
 sid.setChipModel(reSIDuEngine::MOS8580);
-sid.setSamplingParameters(985248, 0, 44100);
+sid.setSamplingParameters(reSIDuEngine::C64_PAL_CPUCLK, 0, 44100);
 ```
 
 ## Advanced Usage
@@ -370,8 +370,8 @@ The SID frequency register is calculated as:
 freq_register = (desired_frequency_Hz * 16777216) / clock_frequency_Hz
 ```
 
-For PAL systems: clock = 985248 Hz
-For NTSC systems: clock = 1022727 Hz
+For PAL systems:  clock = `C64_PAL_CPUCLK`  = 985248 Hz
+For NTSC systems: clock = `C64_NTSC_CPUCLK` = 1022727 Hz
 
 ### Chip Model Selection
 

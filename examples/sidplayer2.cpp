@@ -98,6 +98,11 @@ int subtune_amount = 1;
 int preferred_SID_model = 8580;
 int SID_model = 8580;
 
+// C64 model (affects CPU clock and frame rate)
+int    c64_model     = 0;    // 0 = PAL, 1 = NTSC
+double c64_clock     = reSIDuEngine::C64_PAL_CPUCLK;
+double c64_framerate = reSIDuEngine::PAL_FRAMERATE;
+
 // Timing
 long samplerate = 44100;
 double clk_ratio = reSIDuEngine::C64_PAL_CPUCLK / 44100.0;
@@ -138,6 +143,18 @@ std::unique_ptr<SID> sidInstance;
 ma_device device;
 int tunelength = -1;
 
+// NMI digi state (CIA2 Timer A driven digi samples written to D418)
+double nmiPeriod = 0;   // CIA2-TA period in CPU cycles (0 = disabled)
+double nmiCount  = 0;   // Countdown to next NMI
+byte   nmiDigiD418 = 0xFF; // First D418 write captured from NMI handler (0xFF = none)
+
+// Secondary IRQ chaining: tunes like Arkanoid install a second IRQ handler by
+// writing a new address to $FFFE/$FFFF after the primary handler runs.
+// When detected, we fire the secondary handler in the same audio frame so
+// both music and digi updates get called at the intended rate (2× per frame).
+bool         secondaryIRQPending = false;
+unsigned int secondaryIRQPC      = 0;
+
 //============================================================================
 // Function prototypes
 //============================================================================
@@ -146,6 +163,8 @@ void initCPU(unsigned int mempos);
 void initSID();
 void init(int subt);
 byte CPU();
+void detectNMI();
+void executeNMI();
 void audio_callback(ma_device* pDevice, void* pOutput, const void* pInput, ma_uint32 frameCount);
 void printSIDRegisters();
 
@@ -621,13 +640,17 @@ void init(int subt) {
     A = subtune;
     memory[1] = 0x37;  // Memory banking configuration
     memory[0xDC05] = 0;
+    // CIA1 port defaults: active-low inputs, idle high
+    // Bit 7 of (DC01 & DC00) must be 0 for some game init loops to exit
+    // e.g. Arkanoid's title init loop: CMP #$7F (DC01 AND DC00 == $7F)
+    memory[0xDC00] = 0x7F;
+    memory[0xDC01] = 0xFF;
 
     // Execute init routine with timeout
     for (int timeout = 100000; timeout >= 0; timeout--) {
         if (CPU())
             break;
     }
-
     // Determine frame timing: CIA timer or VSync
     if (timermode[subtune] || memory[0xDC05]) {
         if (!memory[0xDC05]) {
@@ -636,7 +659,7 @@ void init(int subt) {
         }
         frame_sampleperiod = (memory[0xDC04] + memory[0xDC05] * 256) / clk_ratio;
     } else {
-        frame_sampleperiod = samplerate / reSIDuEngine::PAL_FRAMERATE;
+        frame_sampleperiod = samplerate / c64_framerate;
     }
 
     // Determine play address
@@ -694,8 +717,16 @@ void audio_callback(ma_device* pDevice, void* pOutput, const void* pInput, ma_ui
         if (framecnt <= 0) {
             framecnt = frame_sampleperiod;
             finished = 0;
-            PC = playaddr;
+            secondaryIRQPending = false;
+
+            // Simulate hardware IRQ: push return frame targeting 0xEA31, set I flag.
+            // Low byte first (matches BRK push convention used by this CPU emulator).
             SP = 0xFF;
+            memory[0x100 + SP] = 0x31; SP--; SP &= 0xFF;  // PCL of 0xEA31
+            memory[0x100 + SP] = 0xEA; SP--; SP &= 0xFF;  // PCH
+            memory[0x100 + SP] = ST | 0x24; SP--; SP &= 0xFF;  // status (I=0x04, unused=0x20)
+            ST |= 0x04;
+            PC = playaddr;
         }
 
         if (finished == 0) {
@@ -708,8 +739,8 @@ void audio_callback(ma_device* pDevice, void* pOutput, const void* pInput, ma_ui
                     CPUtime += cycles;
                 }
 
-                // IRQ player ROM return handling
-                if ((memory[1] & 3) > 1 && pPC < 0xE000 && (PC == 0xEA31 || PC == 0xEA81)) {
+                // IRQ return detection: RTI from injected frame lands at 0xEA31
+                if (pPC < 0xE000 && (PC == 0xEA31 || PC == 0xEA81)) {
                     finished = 1;
                     break;
                 }
@@ -728,11 +759,47 @@ void audio_callback(ma_device* pDevice, void* pOutput, const void* pInput, ma_ui
                 }
 
                 // Forward SID register writes to reSIDuEngine
-                if (storadd >= 0xD400 && storadd < 0xD420 && sidInstance) {
+                if (storadd >= 0xD400 && storadd < 0xD420 && sidInstance)
                     sidInstance->write(storadd, memory[storadd]);
-                }
             }
             CPUtime -= clk_ratio;
+
+            // Secondary IRQ chaining: detect when a play routine installs a new
+            // handler at $FFFE/$FFFF (VIC raster trick, e.g. Arkanoid) and fire it
+            // in the same frame so both music and digi updates run at the intended rate.
+            if (finished == 1 && !secondaryIRQPending) {
+                unsigned int dynIRQ = memory[0xFFFE] + memory[0xFFFF] * 256;
+                if (dynIRQ >= 0x200 && dynIRQ != playaddr) {
+                    secondaryIRQPending = true;
+                    secondaryIRQPC = dynIRQ;
+                    finished = 0;
+                    SP = 0xFF;
+                    memory[0x100 + SP] = 0x31; SP--; SP &= 0xFF;
+                    memory[0x100 + SP] = 0xEA; SP--; SP &= 0xFF;
+                    memory[0x100 + SP] = ST | 0x24; SP--; SP &= 0xFF;
+                    ST |= 0x04;
+                    PC = dynIRQ;
+                }
+            } else if (finished == 1 && secondaryIRQPending) {
+                secondaryIRQPending = false;
+            }
+        }
+
+        // Fire CIA2-TA NMI digi timer and capture D418 writes from the handler.
+        // The while loop correctly handles rates faster than the audio sample rate.
+        if (nmiPeriod > 0) {
+            nmiCount -= clk_ratio;
+            while (nmiCount <= 0) {
+                nmiCount += nmiPeriod;
+                executeNMI();
+            }
+        }
+
+        // Apply the digi D418 sample captured from the NMI handler.
+        // This must happen before clock() so the SID sees the amplitude step.
+        if (nmiDigiD418 != 0xFF && sidInstance) {
+            sidInstance->write(0xD418, nmiDigiD418);
+            nmiDigiD418 = 0xFF;
         }
 
         // Generate audio sample
@@ -794,6 +861,74 @@ void printSIDRegisters() {
     }
 
     fflush(stdout);
+}
+
+//============================================================================
+// NMI Digi Support (CIA2 Timer A driven)
+//============================================================================
+
+// Scan CIA2 state after init() to detect digi-via-NMI configuration.
+// Many tunes (e.g. Martin Galway / Arkanoid) program CIA2-TA to fire an NMI
+// at the digi sample rate and write the sample byte to D418 from the handler.
+void detectNMI() {
+    nmiPeriod    = 0;
+    nmiCount     = 0;
+    nmiDigiD418  = 0xFF;
+
+    // CIA2 ICR: bit 0 = Timer A underflow generates NMI.
+    // The init routine writes 0x81 (set + bit0) to enable; we read it back from memory.
+    if (!(memory[0xDD0D] & 0x01))
+        return;
+
+    int ta = memory[0xDD04] + memory[0xDD05] * 256;
+    if (ta <= 0)
+        return;
+
+    nmiPeriod = ta;         // CPU cycles between NMI firings
+    nmiCount  = ta;
+    printf("NMI digi: CIA2-TA=%d cycles  rate=%.0f Hz\n",
+           ta, c64_clock / ta);
+}
+
+// Run the NMI handler for one invocation, capturing the first D418 write.
+// Saves/restores the CPU registers so the play routine is not disturbed.
+void executeNMI() {
+    // Resolve NMI vector: check $FFFA/$FFFB first (may be patched by init),
+    // then fall back to the Kernal-indirection RAM vector at $0318/$0319.
+    unsigned int nmiVec = memory[0xFFFA] + memory[0xFFFB] * 256;
+    if (nmiVec < 0x100)
+        nmiVec = memory[0x0318] + memory[0x0319] * 256;
+    if (nmiVec < 0x100)
+        return;  // No valid NMI handler found
+
+    // Save full CPU state
+    byte     sA = A, sX = X, sY = Y, sST = ST;
+    unsigned sPC = PC;
+    byte     sSP = SP;
+
+    // Simulate hardware NMI: push return address (PCH, PCL) then status
+    memory[0x100 + SP] = (sPC >> 8) & 0xFF;  SP--; SP &= 0xFF;
+    memory[0x100 + SP] =  sPC       & 0xFF;  SP--; SP &= 0xFF;
+    memory[0x100 + SP] = sST;                SP--; SP &= 0xFF;
+
+    PC = nmiVec;
+
+    for (int timeout = 2000; timeout >= 0; timeout--) {
+        CPU();
+
+        // Capture first D418 write (the digi sample amplitude)
+        if (storadd == 0xD418 && nmiDigiD418 == 0xFF)
+            nmiDigiD418 = memory[0xD418];
+
+        // RTI restores SP to sSP — that signals the handler has finished
+        if (SP == sSP)
+            break;
+    }
+
+    // Restore A, X, Y (hardware NMI does not preserve them; the handler may or may not).
+    // PC and ST were restored by RTI; if RTI never ran (timeout), restore everything.
+    A = sA;  X = sX;  Y = sY;
+    if (SP != sSP) { SP = sSP;  PC = sPC;  ST = sST; }
 }
 
 //============================================================================
@@ -903,6 +1038,11 @@ int main(int argc, char* argv[]) {
     // Determine SID chip model
     preferred_SID_model = (filedata[0x77] & 0x30) >= 0x20 ? 8580 : 6581;
 
+    // Byte 0x77 bits 2-3: 0x08 = NTSC, 0x04 = PAL, 0x00/0x0C = unknown/any → default PAL
+    c64_model     = ((filedata[0x77] & 0x0C) == 0x08) ? 1 : 0;
+    c64_clock     = c64_model ? reSIDuEngine::C64_NTSC_CPUCLK : reSIDuEngine::C64_PAL_CPUCLK;
+    c64_framerate = c64_model ? reSIDuEngine::NTSC_FRAMERATE   : reSIDuEngine::PAL_FRAMERATE;
+
     // Check for multi-SID configuration
     unsigned int SID_address_2 = filedata[0x7A] >= 0x42 && (filedata[0x7A] < 0x80 || filedata[0x7A] >= 0xE0)
                                      ? 0xD000 + filedata[0x7A] * 16
@@ -922,6 +1062,7 @@ int main(int argc, char* argv[]) {
     printf("Play:     $%04X\n", playaddr);
     printf("Subtunes: %d (playing #%d)\n", subtune_amount, subtune + 1);
     printf("Model:    %d (preferred)\n", preferred_SID_model);
+    printf("C64:      %s\n", c64_model ? "NTSC" : "PAL");
 
     // REJECT MULTI-SID FILES
     if (SIDamount > 1) {
@@ -947,11 +1088,11 @@ int main(int argc, char* argv[]) {
     // Initialize reSIDuEngine
     SIDModel model = (SID_model == 8580) ? MOS8580 : MOS6581;
     sidInstance = std::make_unique<SID>(samplerate, model);
-    sidInstance->setClock(reSIDuEngine::C64_PAL_CPUCLK);
+    sidInstance->setClock(c64_clock);
     sidInstance->reset();
 
     // Calculate clock ratio
-    clk_ratio = reSIDuEngine::C64_PAL_CPUCLK / samplerate;
+    clk_ratio = c64_clock / samplerate;
 
     // Set loaded flag with release semantics to ensure sidInstance initialization
     // is visible to the audio callback thread
@@ -959,6 +1100,16 @@ int main(int argc, char* argv[]) {
 
     // Initialize the SID tune
     init(subtune);
+
+    // Detect CIA2-TA NMI digi timer (must run after init so CIA2 registers are set up)
+    detectNMI();
+
+    // MOS8580 digiboost: inject a persistent full-scale negative DC bias on EXT IN.
+    // Rapid D418 volume writes amplitude-modulate this bias; the 1.6 Hz external
+    // highpass passes the resulting steps as audible digi samples.
+    // MOS6581 does not need this — internal DAC leakage supplies the bias naturally.
+    if (SID_model == 8580)
+        sidInstance->input(-32768);
 
     printf("Frame period: %.2f samples (%.2fHz)\n", frame_sampleperiod,
            samplerate / frame_sampleperiod);
