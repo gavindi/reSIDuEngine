@@ -803,8 +803,6 @@ void audio_callback(ma_device* pDevice, void* pOutput, const void* pInput, ma_ui
         }
 
         // Generate audio sample
-        // Pass enough cycles to ensure we get exactly 1 sample
-        // Adding 1.0 ensures cycles/clkRatio >= 1.0 after integer conversion
         short sample = 0;
         if (sidInstance) {
             unsigned int cycles_per_sample = static_cast<unsigned int>(clk_ratio + 1.0);
@@ -817,16 +815,7 @@ void audio_callback(ma_device* pDevice, void* pOutput, const void* pInput, ma_ui
             memory[0xD41C] = sidInstance->read(0x1C);
         }
 
-        // Scale to reduce volume and prevent clipping
-        int output = static_cast<int>(sample * 0.25f);
-
-        // Clamp to prevent distortion
-        if (output > 32767)
-            output = 32767;
-        else if (output < -32768)
-            output = -32768;
-
-        stream[i] = static_cast<int16_t>(output);
+        stream[i] = sample;
     }
 }
 
@@ -1090,6 +1079,7 @@ int main(int argc, char* argv[]) {
     sidInstance = std::make_unique<SID>(samplerate, model);
     sidInstance->setClock(c64_clock);
     sidInstance->reset();
+    sidInstance->setVolume(0.25f);
 
     // Calculate clock ratio
     clk_ratio = c64_clock / samplerate;

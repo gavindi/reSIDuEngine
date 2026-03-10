@@ -2,6 +2,12 @@
 
 All notable changes to reSIDuEngine will be documented in this file.
 
+## [1.9.1] - 2026-03-10
+
+### Fixed
+- `sidplayer2`: Restored `clk_ratio + 1.0` cycle count for `clock()` calls, ensuring exactly one audio sample is generated per callback slot; the fractional-accumulation replacement caused `floor(22/22.34) = 0` samples ~66% of the time, producing severe choppy and muffled output
+- `sidplayer2`: Volume scaling moved to `sidInstance->setVolume(0.25f)` (called once after `reset()`); redundant inline `sample * 0.25f` cast, manual int clamp, and `int16_t` conversion removed from the audio callback hot path since `clock()` handles clamping and conversion internally
+
 ## [1.9.0] - 2026-03-10
 
 ### Changed
