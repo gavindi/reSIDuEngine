@@ -318,6 +318,24 @@ public:
     unsigned char read(int addr);
 
     /**
+     * Query whether a voice's envelope has released all the way to zero.
+     *
+     * Returns true once the voice's ADSR envelope is parked in its hold-at-zero
+     * state (HOLDZERO_BITMASK) — i.e. the gate is off and the release phase has
+     * fully completed, so the voice contributes exactly zero to the output and
+     * will keep doing so until the next gate event. Unlike the read-back of
+     * register 0x1C (ENV3), which only exposes Voice 3, this works for any voice.
+     *
+     * @param voiceIndex Voice to query (0-2).
+     * @return true if the voice is silent and parked at zero envelope, false otherwise.
+     */
+    bool isVoiceSilent(int voiceIndex) const
+    {
+        return voiceIndex >= 0 && voiceIndex < SID_CHANNELS
+            && (adsrState[voiceIndex] & HOLDZERO_BITMASK) != 0;
+    }
+
+    /**
      * Clock the SID chip and generate audio samples (reSIDfp API compatible).
      *
      * This is the main processing function that advances the SID emulation by
