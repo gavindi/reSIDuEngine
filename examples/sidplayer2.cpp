@@ -797,8 +797,15 @@ void audio_callback(ma_device* pDevice, void* pOutput, const void* pInput, ma_ui
         if (nmiPeriod > 0) {
             nmiCount -= clk_ratio;
             while (nmiCount <= 0) {
-                nmiCount += nmiPeriod;
                 executeNMI();
+                // The handler usually reprograms CIA2 Timer A (often a sequenced,
+                // varying period) and restarts it. Adopt the new latch value so the
+                // next NMI fires at the intended rate; keep the previous period if
+                // it left the timer at zero.
+                int ta = memory[0xDD04] + memory[0xDD05] * 256;
+                if (ta > 0)
+                    nmiPeriod = ta;
+                nmiCount += nmiPeriod;
             }
         }
 
@@ -876,9 +883,24 @@ void detectNMI() {
     if (!(memory[0xDD0D] & 0x01))
         return;
 
-    int ta = memory[0xDD04] + memory[0xDD05] * 256;
-    if (ta <= 0)
+    // We also need a valid NMI handler to jump to.
+    unsigned int nmiVec = memory[0xFFFA] + memory[0xFFFB] * 256;
+    if (nmiVec < 0x100)
+        nmiVec = memory[0x0318] + memory[0x0319] * 256;
+    if (nmiVec < 0x100)
         return;
+
+    int ta = memory[0xDD04] + memory[0xDD05] * 256;
+    if (ta <= 0) {
+        // The NMI is enabled but the tune never programmed CIA2 Timer A during
+        // init (e.g. Rob Hubbard's BMX Kidz). On a real C64 the timer is already
+        // free-running from the power-on/Kernal state (latch $FFFF), so the first
+        // underflow fires an NMI whose handler then loads the real (often much
+        // shorter, sequenced) period. Bootstrap with the $FFFF power-on latch and
+        // let executeNMI's caller pick up the handler-programmed period after the
+        // first firing.
+        ta = 0xFFFF;
+    }
 
     nmiPeriod = ta;         // CPU cycles between NMI firings
     nmiCount  = ta;
@@ -912,9 +934,16 @@ void executeNMI() {
     for (int timeout = 2000; timeout >= 0; timeout--) {
         CPU();
 
-        // Capture first D418 write (the digi sample amplitude)
+        // Capture first D418 write (the digi sample amplitude). Kept for the
+        // volume-register digi tunes where the handler writes then restores D418.
         if (storadd == 0xD418 && nmiDigiD418 == 0xFF)
             nmiDigiD418 = memory[0xD418];
+
+        // Forward SID register writes to the engine. Some tunes drive the entire
+        // music player from the CIA2-TA NMI (e.g. BMX Kidz), so the voice, filter
+        // and control writes happen here, not in the frame play routine.
+        if (storadd >= 0xD400 && storadd < 0xD420 && sidInstance)
+            sidInstance->write(storadd, memory[storadd]);
 
         // RTI restores SP to sSP — that signals the handler has finished
         if (SP == sSP)
@@ -978,7 +1007,12 @@ int main(int argc, char* argv[]) {
             filedata[datalen++] = readata;
     } while (readata != EOF && datalen < 65536);
     fclose(InputFile);
-    datalen--;
+    // datalen is now the exact file size. Do NOT decrement it: the load loop
+    // below uses `i < datalen`, so decrementing drops the final file byte. That
+    // last byte is significant for tunes whose data ends exactly at a used
+    // address, e.g. Galway's Wizball, whose last byte is the high byte of a
+    // raster-split jump-table entry; dropping it sends that split to $0003 and
+    // hangs the player (silent playback).
 
     printf("Loaded: %s (%d bytes)\n", argv[1], datalen);
 

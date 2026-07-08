@@ -2,6 +2,13 @@
 
 All notable changes to reSIDuEngine will be documented in this file.
 
+## [1.9.4] - 2026-07-08
+
+### Fixed
+- `sidplayer2`: Loader no longer drops the final byte of the SID file. The read loop left `datalen` at the exact file size but a stray `datalen--` combined with the `i < datalen` load bound truncated the last data byte. This silently corrupted tunes whose data ends exactly at a used address — e.g. Martin Galway's `Wizball`, whose last byte is the high byte of a raster-split jump-table entry; without it the split jumped to `$0003` and hung the raster-split counter, so the music tick never fired (silent playback)
+- `sidplayer2`: CIA2 Timer A NMI playback now bootstraps and tracks a varying period, fixing NMI-driven tunes whose music runs entirely from the NMI handler (e.g. Rob Hubbard's `BMX Kidz`, subtune 1). `detectNMI()` now activates when the NMI is enabled with a valid handler even if the tune left CIA2 Timer A unprogrammed (it relies on the C64 power-on latch of `$FFFF` to fire the first NMI); the audio callback re-reads the handler-reprogrammed latch after each NMI so sequenced/variable NMI rates track correctly; and `executeNMI()` now forwards all `$D400–$D41F` writes to the engine (previously only the `$D418` digi byte was captured), so voice, filter and control writes made from the NMI are heard
+- Verified no regressions across `Skate or Die` (NMI digi), `Arkanoid` (secondary IRQ), `Commando`, `Delta`, `Monty on the Run`, `Sanxion`, `Comic Bakery`, and `Times of Lore`
+
 ## [1.9.3] - 2026-07-08
 
 ### Fixed
