@@ -2,6 +2,13 @@
 
 All notable changes to reSIDuEngine will be documented in this file.
 
+## [1.9.3] - 2026-07-08
+
+### Fixed
+- `sidplayer2`: Play routine is again invoked as a subroutine instead of via a synthetic IRQ return frame, fixing tunes that crashed into silence after a few frames (e.g. `Rambo: First Blood Part II` by Martin Galway). The 3-byte IRQ frame injection added in 1.9.0 left an extra byte on the stack; Galway-style players that use RTS-based dispatch (with a deliberate JSR/RTS imbalance) then read a wrong return address, land mid-instruction, and fall into an infinite `BRK` loop. The frame trigger now sets `SP=0xFF`, sets the I flag, and jumps to the play address; completion is detected when the routine pops past the empty stack (`CPU()` returns `>= 0xFE`), matching libsidplayfp's driver (`psiddrv.a65` `irqjob`: `jsr play`, where the play routine ends in RTS/RTI and the RTI lives in the driver wrapper, not the play routine)
+- `sidplayer2`: Secondary IRQ chaining (Arkanoid raster trick) enters the secondary handler as a subroutine too, for the same reason
+- Verified no regressions: `Skate or Die` (NMI digi), `Arkanoid` (secondary IRQ), `Commando`, and `Delta` all still play
+
 ## [1.9.1] - 2026-03-10
 
 ### Fixed

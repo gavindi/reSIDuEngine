@@ -719,13 +719,20 @@ void audio_callback(ma_device* pDevice, void* pOutput, const void* pInput, ma_ui
             finished = 0;
             secondaryIRQPending = false;
 
-            // Simulate hardware IRQ: push return frame targeting 0xEA31, set I flag.
-            // Low byte first (matches BRK push convention used by this CPU emulator).
+            // Call the play routine as a subroutine, matching libsidplayfp's driver
+            // (psiddrv.a65 "irqjob": `jsr play`). The play routine ends with RTS (or
+            // RTI); completion is detected when it pops past the empty stack, i.e.
+            // CPU() returns >= 0xFE (see the RTS/RTI guards in CPU()).
+            //
+            // Do NOT push a synthetic 3-byte IRQ return frame here. On real hardware
+            // the IRQ frame is consumed by the driver wrapper *before* it calls play,
+            // never by the play routine itself. Galway-style tunes (e.g. Rambo) use
+            // RTS-based dispatch with a deliberate JSR/RTS imbalance; an injected
+            // frame leaves an extra byte on the stack, so their dispatch RTS reads a
+            // wrong return address and the player crashes into a BRK loop (silence)
+            // after a few frames.
             SP = 0xFF;
-            memory[0x100 + SP] = 0x31; SP--; SP &= 0xFF;  // PCL of 0xEA31
-            memory[0x100 + SP] = 0xEA; SP--; SP &= 0xFF;  // PCH
-            memory[0x100 + SP] = ST | 0x24; SP--; SP &= 0xFF;  // status (I=0x04, unused=0x20)
-            ST |= 0x04;
+            ST |= 0x04;   // I flag set: the play routine runs with interrupts disabled
             PC = playaddr;
         }
 
@@ -739,7 +746,8 @@ void audio_callback(ma_device* pDevice, void* pOutput, const void* pInput, ma_ui
                     CPUtime += cycles;
                 }
 
-                // IRQ return detection: RTI from injected frame lands at 0xEA31
+                // Completion fallback for tunes that install their own IRQ handler
+                // and hand control back through the Kernal IRQ return at 0xEA31/0xEA81.
                 if (pPC < 0xE000 && (PC == 0xEA31 || PC == 0xEA81)) {
                     finished = 1;
                     break;
@@ -773,10 +781,9 @@ void audio_callback(ma_device* pDevice, void* pOutput, const void* pInput, ma_ui
                     secondaryIRQPending = true;
                     secondaryIRQPC = dynIRQ;
                     finished = 0;
+                    // Enter the secondary handler as a subroutine too (see the frame
+                    // trigger above for why no synthetic IRQ frame is pushed).
                     SP = 0xFF;
-                    memory[0x100 + SP] = 0x31; SP--; SP &= 0xFF;
-                    memory[0x100 + SP] = 0xEA; SP--; SP &= 0xFF;
-                    memory[0x100 + SP] = ST | 0x24; SP--; SP &= 0xFF;
                     ST |= 0x04;
                     PC = dynIRQ;
                 }
