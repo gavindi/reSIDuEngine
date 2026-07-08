@@ -148,6 +148,34 @@ double nmiPeriod = 0;   // CIA2-TA period in CPU cycles (0 = disabled)
 double nmiCount  = 0;   // Countdown to next NMI
 byte   nmiDigiD418 = 0xFF; // First D418 write captured from NMI handler (0xFF = none)
 
+// CIA2 interrupt-enable mask, tracked so the NMI can be armed/disarmed at
+// runtime. The raw $DD0D byte cannot be inspected directly: writes use the
+// CIA's set/clear semantics (bit 7 = set-or-clear the mask bits that are 1),
+// so e.g. writing $7F *clears* all five sources even though bit 0 reads as 1.
+//
+// We deliberately key only on the ICR ($DD0D), not the timer control register
+// ($DD0E). Clearing the ICR is a tune's way of permanently retiring the NMI
+// source (e.g. Rob Hubbard's I, Ball, whose $C03E writes $DD0D=$7F once its
+// one-shot digi sample finishes — after which the NMI must stop or its exhausted
+// handler spews garbage and collapses playback). Stopping the timer alone
+// ($DD0E bit 0 = 0) is a transient thing other digi players do every sample
+// block and immediately re-arm (e.g. BMX Kidz); honouring that would wrongly
+// silence them, so it is ignored here.
+int cia2IcrMask = 0;   // Enabled CIA2 interrupt sources (bit 0 = Timer A NMI)
+
+// Apply CIA2 $DD0D (ICR) write set/clear semantics to the tracked enable mask.
+inline void noteCIA2Write(unsigned int a, byte v) {
+    if (a != 0xDD0D) return;
+    int prev = cia2IcrMask;
+    if (v & 0x80) cia2IcrMask |=  (v & 0x1F);   // bit7=1: set the 1-bits
+    else          cia2IcrMask &= ~(v & 0x1F);   // bit7=0: clear the 1-bits
+    // Timer A NMI just re-armed: adopt its latch as the period and schedule it.
+    if (!(prev & 0x01) && (cia2IcrMask & 0x01)) {
+        int ta = memory[0xDD04] + memory[0xDD05] * 256;
+        if (ta > 0) { nmiPeriod = ta; nmiCount = ta; }
+    }
+}
+
 // Secondary IRQ chaining: tunes like Arkanoid install a second IRQ handler by
 // writing a new address to $FFFE/$FFFF after the primary handler runs.
 // When detected, we fire the secondary handler in the same audio frame so
@@ -769,6 +797,12 @@ void audio_callback(ma_device* pDevice, void* pOutput, const void* pInput, ma_ui
                 // Forward SID register writes to reSIDuEngine
                 if (storadd >= 0xD400 && storadd < 0xD420 && sidInstance)
                     sidInstance->write(storadd, memory[storadd]);
+
+                // Track CIA2 NMI enable from the play routine too, so a tune that
+                // re-arms the digi NMI mid-song resumes it (and one that retires
+                // it via the ICR stops it).
+                if (storadd == 0xDD0D)
+                    noteCIA2Write(storadd, memory[storadd]);
             }
             CPUtime -= clk_ratio;
 
@@ -794,10 +828,20 @@ void audio_callback(ma_device* pDevice, void* pOutput, const void* pInput, ma_ui
 
         // Fire CIA2-TA NMI digi timer and capture D418 writes from the handler.
         // The while loop correctly handles rates faster than the audio sample rate.
-        if (nmiPeriod > 0) {
+        // Only fire while the NMI is actually armed: some tunes play a one-shot
+        // digi sample and then disarm the timer from inside the handler (e.g.
+        // I, Ball's $C03E). If we kept firing the exhausted routine it would spew
+        // garbage $D418 writes and collapse the music to near-silence.
+        if (nmiPeriod > 0 && (cia2IcrMask & 0x01)) {
             nmiCount -= clk_ratio;
             while (nmiCount <= 0) {
                 executeNMI();
+                // The handler may retire the NMI source (one-shot digi finished,
+                // e.g. I, Ball). Honour it immediately so we don't fire again.
+                if (!(cia2IcrMask & 0x01)) {
+                    nmiCount = 0;
+                    break;
+                }
                 // The handler usually reprograms CIA2 Timer A (often a sequenced,
                 // varying period) and restarts it. Adopt the new latch value so the
                 // next NMI fires at the intended rate; keep the previous period if
@@ -877,6 +921,7 @@ void detectNMI() {
     nmiPeriod    = 0;
     nmiCount     = 0;
     nmiDigiD418  = 0xFF;
+    cia2IcrMask  = 0;
 
     // CIA2 ICR: bit 0 = Timer A underflow generates NMI.
     // The init routine writes 0x81 (set + bit0) to enable; we read it back from memory.
@@ -904,6 +949,7 @@ void detectNMI() {
 
     nmiPeriod = ta;         // CPU cycles between NMI firings
     nmiCount  = ta;
+    cia2IcrMask      = 0x01; // Timer A NMI armed (verified via $DD0D bit 0 above)
     printf("NMI digi: CIA2-TA=%d cycles  rate=%.0f Hz\n",
            ta, c64_clock / ta);
 }
@@ -924,7 +970,11 @@ void executeNMI() {
     unsigned sPC = PC;
     byte     sSP = SP;
 
-    // Simulate hardware NMI: push return address (PCH, PCL) then status
+    // Simulate a hardware NMI: push a return frame (PCH, PCL, SR) then run the
+    // handler until its RTI pops the frame back. The frame gives the handler's RTI
+    // something to return to; we don't trust the resulting PC to resume the
+    // interrupted code, though (see the context restore below). Only the handler's
+    // side effects (SID/CIA writes, sample-pointer advance) are meant to persist.
     memory[0x100 + SP] = (sPC >> 8) & 0xFF;  SP--; SP &= 0xFF;
     memory[0x100 + SP] =  sPC       & 0xFF;  SP--; SP &= 0xFF;
     memory[0x100 + SP] = sST;                SP--; SP &= 0xFF;
@@ -939,21 +989,34 @@ void executeNMI() {
         if (storadd == 0xD418 && nmiDigiD418 == 0xFF)
             nmiDigiD418 = memory[0xD418];
 
+        // Track CIA2 NMI enable so a handler that retires the NMI via the ICR
+        // (e.g. I, Ball's one-shot digi finishing via $C03E) actually stops it.
+        if (storadd == 0xDD0D)
+            noteCIA2Write(storadd, memory[storadd]);
+
         // Forward SID register writes to the engine. Some tunes drive the entire
         // music player from the CIA2-TA NMI (e.g. BMX Kidz), so the voice, filter
         // and control writes happen here, not in the frame play routine.
         if (storadd >= 0xD400 && storadd < 0xD420 && sidInstance)
             sidInstance->write(storadd, memory[storadd]);
 
-        // RTI restores SP to sSP — that signals the handler has finished
+        // RTI (or the timeout) returns SP to sSP — the handler has finished.
         if (SP == sSP)
             break;
     }
 
-    // Restore A, X, Y (hardware NMI does not preserve them; the handler may or may not).
-    // PC and ST were restored by RTI; if RTI never ran (timeout), restore everything.
+    // Restore A/X/Y (a real NMI leaves these to the handler, which saved them).
     A = sA;  X = sX;  Y = sY;
-    if (SP != sSP) { SP = sSP;  PC = sPC;  ST = sST; }
+
+    // Resume the interrupted code. When the NMI fired while the play routine was
+    // still mid-execution (finished == 0, e.g. I, Ball's digi NMI interrupting the
+    // music), the popped PC cannot be trusted — this CPU core's RTI can rebuild a
+    // byte-swapped PC — so restore PC/SP/ST exactly and let the play routine carry
+    // on where it left off. When the NMI fired between frames (finished == 1) the
+    // resume PC is irrelevant (the next frame reloads it), so leave the handler's
+    // RTI result untouched, matching the long-standing behaviour that other digi
+    // tunes (e.g. BMX Kidz) rely on. A timeout (SP != sSP) always forces a restore.
+    if (finished == 0 || SP != sSP) { SP = sSP;  PC = sPC;  ST = sST; }
 }
 
 //============================================================================

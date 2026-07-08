@@ -1332,8 +1332,18 @@ float SID::processSID()
     // The /15.0 from master volume brings it to approximately ±0.1 to ±1.5
     // depending on the volume setting (0-15)
 
-    // Scale output
-    float result = static_cast<float>((output / 0x10000) * (SIDRegister[0x18] & 0xF) / 15.0f);
+    // Scale output by the 4-bit master volume, and add a DC bias equal to that
+    // same volume. Volume-register ("$D418") digi tunes play samples by writing
+    // the 4-bit master volume at a high rate; with silent voices the multiplied
+    // term alone is zero, so nothing would be heard. The additive bias turns each
+    // volume write into an output step, which the external 1.6 Hz high-pass below
+    // converts into the audible digi waveform. For ordinary tunes the master
+    // volume is steady, so the bias is a constant the high-pass removes — leaving
+    // their sound unchanged. (Rob Hubbard's BMX Kidz relies on this: its music is
+    // driven from a raster loop this player cannot fully track, so the CIA2 NMI
+    // digi carries the audio on its own.)
+    float volNorm = (SIDRegister[0x18] & 0xF) / 15.0f;
+    float result  = static_cast<float>((output / 0x10000) * volNorm) + volNorm;
 
     // External RC filter: LP at ~16 kHz (near-transparent), HP at ~1.6 Hz (DC removal)
     externalLowpass  += extLPCoeff * (result      - externalLowpass);
