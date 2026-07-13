@@ -2,6 +2,14 @@
 
 All notable changes to reSIDuEngine will be documented in this file.
 
+## [1.9.6] - 2026-07-14
+
+### Changed
+- Updated `assets/logo/reSIDuEngine1.png`
+
+### Added
+- `assets/logo/reSIDuEngine_Small1.png`
+
 ## [1.9.5] - 2026-07-08
 
 ### Fixed
